@@ -1,0 +1,21 @@
+{
+  "name": "my-insane-claude-workflow",
+  "version": "1.0.0",
+  "description": "Launch the Claude Code TUI through a local Anthropic-compatible gateway, keep the main session on Anthropic, and route workflow subagents to Codex.",
+  "type": "module",
+  "bin": {
+    "claude-workflow": "js/cli/claude-workflow.js"
+  },
+  "scripts": {
+    "start": "node js/cli/claude-workflow.js",
+    "link:cli": "npm link"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "express": "^5.1.0"
+  },
+  "license": "MIT"
+}
