@@ -5,38 +5,53 @@ import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
-import { envFlag, isGatewayLoopbackHost, loadGatewayConfig } from '../gateway/config.js';
-import {
-  ROUTE_ENTRY_REASONING_KEYS,
-  ROUTE_ENTRY_UPSTREAM_MODEL_KEYS,
-  resolveModelRoute,
-  routeEntryValue,
-} from '../gateway/model-routing.js';
+import { envFlag, isGatewayLoopbackHost } from '../gateway/config.js';
+import { resolveModelRoute } from '../gateway/model-routing.js';
 import { createGatewayServer } from '../gateway/server.js';
+import {
+  buildWorkflowClientEnv,
+  buildWorkflowGatewayConfig,
+  routeProvider,
+  routeTargetSummary,
+} from '../gateway/workflow-config.js';
 
 const SIGNAL_NUMBERS = {
   SIGINT: 2,
   SIGTERM: 15,
 };
 const CODEX_LOGIN_STATUS_TIMEOUT_MS = 10_000;
-const WORKFLOW_CODEX_IDLE_TIMEOUT_MS = 120_000;
 const CODEX_LOGIN_FAILURE_PATTERN =
   /not\s+logged\s+in|logged\s+out|not\s+authenticated|not\s+signed\s+in/u;
 const CODEX_LOGIN_SUCCESS_PATTERN = /logged in|authenticated|signed in/u;
+const CLAUDE_OPTIONAL_VALUE_FLAGS = new Set(['--resume', '-r', '--from-pr']);
+const CLAUDE_REQUIRED_VALUE_FLAGS = new Set(['--session-id']);
+const CLAUDE_SESSION_FLAGS = new Set([
+  '--continue',
+  '-c',
+  '--fork-session',
+  ...CLAUDE_OPTIONAL_VALUE_FLAGS,
+  ...CLAUDE_REQUIRED_VALUE_FLAGS,
+]);
 
 function usage() {
   return [
     'Usage:',
     '  claude-workflow',
     '  claude-workflow "Use a workflow to delegate a tiny subagent task."',
+    '  claude-workflow --resume <session-id>',
+    '  claude-workflow --continue',
     '',
     'Behavior:',
     '  - no arguments: starts normal interactive Claude Code on the configured main/frontier model through a local gateway',
     '  - each launch uses an OS-assigned localhost port unless ULTRATHINK_GATEWAY_PORT is set',
     '  - Workflow subagents default to a Codex/GPT-labeled model id mapped to a Codex route',
     '  - routed subagent responses also report Codex/GPT metadata in Claude Code UI by default',
+    '  - sonnet/haiku/opus alias slots remap to the routed subagent model id, so alias-pinned agents display and use the Codex-backed id (override with ANTHROPIC_DEFAULT_SONNET_MODEL etc.)',
+    '  - Codex input budgets adapt to the context window the Codex app-server reports (configured ceiling: ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS, default 180k), and live sessions recycle before the window can overflow',
+    '  - workflows launched or resumed outside claude-workflow need the shared gateway daemon (claude-workflow-gateway) or routed model ids will 404 at Anthropic',
     '  - other non-frontier Claude model ids also route to Codex by default',
     '  - with prompt text: runs a one-shot "claude -p" prompt through the same gateway',
+    '  - --resume, -r, --continue, -c, --fork-session, --from-pr, and --session-id pass through to interactive Claude',
     '  - interactive and one-shot launches default to --dangerously-skip-permissions auto mode',
     '  - --yolo and --dangerously-skip-permissions keep auto mode explicit',
     '  - --no-yolo or CLAUDE_WORKFLOW_SKIP_PERMISSIONS=false restores permission prompts',
@@ -49,95 +64,12 @@ function usage() {
   ].join('\n');
 }
 
-function envString(name, fallback = '') {
-  const value = process.env[name];
-  if (typeof value !== 'string' || value.trim() === '') {
-    return fallback;
-  }
-
-  return value.trim();
-}
-
-function displayRoutedModel() {
-  if (envString('CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL')) {
-    return envFlag('CLAUDE_WORKFLOW_DISPLAY_ROUTED_MODEL', true);
-  }
-
-  return envFlag('ULTRATHINK_GATEWAY_DISPLAY_ROUTED_MODEL', true);
-}
-
 function shouldPrintStack() {
   return envFlag('CLAUDE_WORKFLOW_DEBUG', envFlag('ULTRATHINK_WORKFLOWS_DEBUG', false));
 }
 
 function printError(message) {
   process.stderr.write(`claude-workflow: ${message}\n`);
-}
-
-function dedupeStrings(values) {
-  const seen = new Set();
-  const result = [];
-
-  for (const value of values) {
-    if (typeof value !== 'string' || value.trim() === '') {
-      continue;
-    }
-
-    const normalized = value.trim();
-    if (seen.has(normalized)) {
-      continue;
-    }
-
-    seen.add(normalized);
-    result.push(normalized);
-  }
-
-  return result;
-}
-
-function modelIdPart(value) {
-  if (typeof value !== 'string') {
-    return 'model';
-  }
-
-  const normalized = value
-    .trim()
-    .replace(/[^A-Za-z0-9._-]+/gu, '-')
-    .replace(/-+/gu, '-')
-    .replace(/^-|-$/gu, '');
-
-  return normalized || 'model';
-}
-
-function routeProvider(route, fallback = 'codex') {
-  return routeEntryValue(route, ['provider'], fallback);
-}
-
-function routeUpstreamModel(route, fallback) {
-  return routeEntryValue(route, ROUTE_ENTRY_UPSTREAM_MODEL_KEYS, fallback);
-}
-
-function routeReasoningEffort(route, fallback = '') {
-  return routeEntryValue(route, ROUTE_ENTRY_REASONING_KEYS, fallback);
-}
-
-function routedModelId(provider, upstreamModel, reasoningEffort, requestedModel) {
-  const effort = reasoningEffort ? `-${modelIdPart(reasoningEffort)}` : '';
-  return [
-    `${modelIdPart(provider)}-${modelIdPart(upstreamModel)}${effort}`,
-    modelIdPart(requestedModel),
-  ].join('-via-');
-}
-
-function routeTargetSummary(route) {
-  const provider = routeProvider(route);
-  if (provider === 'anthropic') {
-    return 'anthropic';
-  }
-
-  const model = routeUpstreamModel(route, 'default');
-  const effort = routeReasoningEffort(route);
-  return `${provider}:${model}${effort ? `/${effort}` : ''}`;
 }
 
 function isExecutableCommand(commandName) {
@@ -168,11 +100,13 @@ function isExecutableCommand(commandName) {
 }
 
 function codexLoginReady(commandName) {
+  const isWindows = process.platform === 'win32';
   const result = spawnSync(commandName, ['login', 'status'], {
     cwd: process.cwd(),
     env: process.env,
     encoding: 'utf8',
     timeout: CODEX_LOGIN_STATUS_TIMEOUT_MS,
+    shell: isWindows,
   });
   const output = `${result.stdout || ''}${result.stderr || ''}`.toLowerCase();
 
@@ -182,22 +116,6 @@ function codexLoginReady(commandName) {
     !CODEX_LOGIN_FAILURE_PATTERN.test(output) &&
     CODEX_LOGIN_SUCCESS_PATTERN.test(output)
   );
-}
-
-function parseRequestedPort() {
-  const configuredPort = envString('ULTRATHINK_GATEWAY_PORT');
-  if (!configuredPort) {
-    return 0;
-  }
-
-  const parsed = Number(configuredPort);
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
-    throw new Error(
-      `ULTRATHINK_GATEWAY_PORT must be an integer between 0 and 65535, got ${configuredPort}`
-    );
-  }
-
-  return parsed;
 }
 
 function describeGatewayListenError(error, config) {
@@ -218,6 +136,7 @@ function describeGatewayListenError(error, config) {
 }
 
 function parseCliArgs(rawArgs) {
+  const claudeArgs = [];
   const promptArgs = [];
   let skipPermissions = envFlag(
     'CLAUDE_WORKFLOW_SKIP_PERMISSIONS',
@@ -225,7 +144,8 @@ function parseCliArgs(rawArgs) {
   );
   let passthrough = false;
 
-  for (const arg of rawArgs) {
+  for (let index = 0; index < rawArgs.length; index += 1) {
+    const arg = rawArgs[index];
     if (passthrough) {
       promptArgs.push(arg);
       continue;
@@ -246,10 +166,29 @@ function parseCliArgs(rawArgs) {
       continue;
     }
 
+    const equalsIndex = arg.indexOf('=');
+    const flagName = equalsIndex > 0 ? arg.slice(0, equalsIndex) : arg;
+    if (CLAUDE_SESSION_FLAGS.has(flagName)) {
+      claudeArgs.push(arg);
+      if (
+        equalsIndex < 0 &&
+        (CLAUDE_REQUIRED_VALUE_FLAGS.has(flagName) ||
+          (CLAUDE_OPTIONAL_VALUE_FLAGS.has(flagName) && !rawArgs[index + 1]?.startsWith('-')))
+      ) {
+        const value = rawArgs[index + 1];
+        if (typeof value === 'string') {
+          claudeArgs.push(value);
+          index += 1;
+        }
+      }
+      continue;
+    }
+
     promptArgs.push(arg);
   }
 
   return {
+    claudeArgs,
     promptArgs,
     skipPermissions,
   };
@@ -257,93 +196,6 @@ function parseCliArgs(rawArgs) {
 
 function isHelpRequest(rawArgs) {
   return rawArgs.length === 1 && (rawArgs[0] === '--help' || rawArgs[0] === '-h');
-}
-
-function buildGatewayConfig() {
-  const baseConfig = loadGatewayConfig();
-  const mainModelId = envString('ULTRATHINK_GATEWAY_MAIN_MODEL_ID', 'claude-fable-5');
-  const rawSubagentModelId = envString(
-    'ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID',
-    'claude-sonnet-4-7'
-  );
-  const subagentUpstreamModel = envString(
-    'ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL',
-    baseConfig.codex.model
-  );
-  const subagentReasoningEffort = envString(
-    'ULTRATHINK_GATEWAY_SUBAGENT_REASONING_EFFORT',
-    'medium'
-  );
-  const subagentVerbosity = envString('ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY', 'high');
-  const defaultMainRoute = {
-    provider: 'anthropic',
-    model: mainModelId,
-    displayName: 'Claude Workflow Frontier Route',
-  };
-  const defaultSubagentRoute = {
-    provider: 'codex',
-    model: subagentUpstreamModel,
-    reasoningEffort: subagentReasoningEffort,
-    verbosity: subagentVerbosity,
-    displayName: 'Codex Subagent Route',
-  };
-  const baseRouteMap = baseConfig.routeMap || {};
-  const subagentRoute = baseRouteMap[rawSubagentModelId] || defaultSubagentRoute;
-  const displayModels = displayRoutedModel();
-  const subagentModelId = displayModels
-    ? envString(
-        'CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID',
-        routedModelId(
-          routeProvider(subagentRoute),
-          routeUpstreamModel(subagentRoute, subagentUpstreamModel),
-          routeReasoningEffort(subagentRoute, subagentReasoningEffort),
-          rawSubagentModelId
-        )
-      )
-    : rawSubagentModelId;
-  const routeMap = {
-    [rawSubagentModelId]: defaultSubagentRoute,
-    [subagentModelId]: subagentRoute,
-    [mainModelId]: defaultMainRoute,
-    ...baseRouteMap,
-  };
-  // Keep only the frontier main model on Anthropic. Every other Claude id
-  // (Opus, Sonnet, Haiku, ...) falls through to the Codex gpt-5.5 route unless
-  // the operator pins their own passthrough list. Frontier dated variants
-  // (e.g. claude-fable-5-20260601) stay on Anthropic via the trailing wildcard.
-  const passthroughEnvProvided =
-    envString('ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS') !== '' ||
-    envString('ULTRATHINK_GATEWAY_PASSTHROUGH_MODEL_IDS') !== '';
-  const anthropicPassthroughModels = passthroughEnvProvided
-    ? baseConfig.anthropicPassthroughModels
-    : [`${mainModelId}*`];
-
-  return {
-    config: {
-      ...baseConfig,
-      host: envString('ULTRATHINK_GATEWAY_HOST', baseConfig.host || '127.0.0.1'),
-      port: parseRequestedPort(),
-      displayRoutedModel: displayModels,
-      routeMap,
-      anthropicPassthroughModels,
-      codex: {
-        ...baseConfig.codex,
-        idleTimeoutMs: envString('ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS')
-          ? baseConfig.codex.idleTimeoutMs
-          : WORKFLOW_CODEX_IDLE_TIMEOUT_MS,
-      },
-      exposedModels: dedupeStrings([
-        mainModelId,
-        rawSubagentModelId,
-        subagentModelId,
-        ...(baseConfig.exposedModels || []),
-      ]),
-    },
-    mainModelId,
-    subagentModelId,
-    rawSubagentModelId,
-    subagentRoute,
-  };
 }
 
 function waitForServer(server) {
@@ -381,37 +233,23 @@ function resolvedGatewayPort(server) {
 }
 
 function buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId) {
-  const claudeEnv = {
-    ANTHROPIC_BASE_URL: gatewayBaseUrl,
-    CLAUDE_CODE_SUBAGENT_MODEL: subagentModelId,
-    CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY: envString(
-      'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY',
-      '0'
-    ),
-  };
-
-  if (config.sharedSecret) {
-    claudeEnv.ANTHROPIC_AUTH_TOKEN = config.sharedSecret;
-    claudeEnv.ANTHROPIC_API_KEY = config.sharedSecret;
-  }
-
-  return claudeEnv;
+  return buildWorkflowClientEnv(config, gatewayBaseUrl, subagentModelId);
 }
 
-function buildClaudeArgs(mainModelId, promptArgs, skipPermissions) {
-  if (promptArgs.length === 0) {
-    const claudeArgs = ['--model', mainModelId];
+function buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions) {
+  if (claudeArgs.length > 0 || promptArgs.length === 0) {
+    const nextArgs = ['--model', mainModelId, ...claudeArgs, ...promptArgs];
     if (skipPermissions) {
-      claudeArgs.unshift('--dangerously-skip-permissions');
+      nextArgs.unshift('--dangerously-skip-permissions');
     }
-    return claudeArgs;
+    return nextArgs;
   }
 
-  const claudeArgs = ['-p', '--model', mainModelId, promptArgs.join(' ')];
+  const nextArgs = ['-p', '--model', mainModelId, promptArgs.join(' ')];
   if (skipPermissions) {
-    claudeArgs.splice(1, 0, '--dangerously-skip-permissions');
+    nextArgs.splice(1, 0, '--dangerously-skip-permissions');
   }
-  return claudeArgs;
+  return nextArgs;
 }
 
 function assertPreflight(config, mainRoute) {
@@ -454,6 +292,7 @@ function signalExitCode(signal) {
 
 function runClaude(args, extraEnv, onChild = null) {
   return new Promise(function run(resolve, reject) {
+    const isWindows = process.platform === 'win32';
     const child = spawn('claude', args, {
       cwd: process.cwd(),
       env: {
@@ -461,6 +300,7 @@ function runClaude(args, extraEnv, onChild = null) {
         ...extraEnv,
       },
       stdio: 'inherit',
+      shell: isWindows,
     });
 
     onChild?.(child);
@@ -490,7 +330,7 @@ async function closeGateway(runtime) {
 
 async function main() {
   const rawArgs = process.argv.slice(2);
-  const { promptArgs, skipPermissions } = parseCliArgs(rawArgs);
+  const { claudeArgs, promptArgs, skipPermissions } = parseCliArgs(rawArgs);
 
   if (isHelpRequest(rawArgs)) {
     process.stdout.write(`${usage()}\n`);
@@ -498,14 +338,14 @@ async function main() {
   }
 
   const { config, mainModelId, rawSubagentModelId, subagentModelId, subagentRoute } =
-    buildGatewayConfig();
-  const mainRoute = resolveModelRoute(mainModelId, config);
+    buildWorkflowGatewayConfig();
+  const resolvedMainRoute = resolveModelRoute(mainModelId, config);
   // Fail fast on launcher-managed subagent routes before starting Claude.
   resolveModelRoute(rawSubagentModelId, config);
   if (subagentModelId !== rawSubagentModelId) {
     resolveModelRoute(subagentModelId, config);
   }
-  assertPreflight(config, mainRoute);
+  assertPreflight(config, resolvedMainRoute);
 
   let runtime = null;
   let claudeChild = null;
@@ -533,6 +373,11 @@ async function main() {
     const gatewayBaseUrl = `http://${config.host}:${resolvedGatewayPort(runtime.server)}`;
     process.stderr.write(`claude-workflow: gateway ready at ${gatewayBaseUrl}\n`);
     process.stderr.write(`claude-workflow: main model ${mainModelId}\n`);
+    if (routeProvider(resolvedMainRoute) !== 'anthropic') {
+      process.stderr.write(
+        `claude-workflow: main route ${mainModelId} -> ${routeTargetSummary(resolvedMainRoute)}\n`
+      );
+    }
     process.stderr.write(`claude-workflow: subagent model ${subagentModelId}\n`);
     if (subagentModelId !== rawSubagentModelId) {
       process.stderr.write(
@@ -541,7 +386,7 @@ async function main() {
     }
 
     const exitCode = await runClaude(
-      buildClaudeArgs(mainModelId, promptArgs, skipPermissions),
+      buildClaudeArgs(mainModelId, claudeArgs, promptArgs, skipPermissions),
       buildClaudeEnvironment(config, gatewayBaseUrl, subagentModelId),
       function onChild(child) {
         claudeChild = child;

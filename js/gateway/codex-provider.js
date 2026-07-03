@@ -6,14 +6,93 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
+// Cold-start bound only: once the Codex app-server reports the model's real
+// context window (thread/tokenUsage/updated), budgets adapt to it. Codex
+// gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
+// thread overhead, so keep the pre-learning default safely below that.
+const DEFAULT_INPUT_MAX_TOKENS = 192_000;
+// Fraction of the reported context window usable as input budget; the rest
+// is headroom for the model's reasoning and output.
+const CODEX_WINDOW_INPUT_FRACTION = 0.8;
 const DEFAULT_MAX_SESSIONS = 16;
+const SUPPORTS_PROCESS_GROUP_SIGNALS = process.platform !== 'win32';
+const INPUT_TRUNCATION_NOTICE = '[content omitted to fit Codex context budget]';
+const TRANSCRIPT_OMISSION_NOTICE = '[older transcript omitted to fit Codex context budget]';
+const NON_RESERVING_SELECTION_REASONS = new Set([
+  'matching_tool_result',
+  'boundary_replay',
+  'routing_reservation_replay',
+]);
+// Selection reasons under which a between-turns session may be recycled for
+// context pressure; replay-style selections must keep their session intact.
+const RECYCLE_ELIGIBLE_SELECTION_REASONS = new Set(['canonical', 'matching_tool_result']);
 const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
   /remote app server .*transport failed/iu,
   /WebSocket protocol error: Connection reset without closing handshake/iu,
 ];
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+// Recycle a live Codex session before its real context (as reported by the
+// app-server) can overflow the model window: long tool loops accumulate
+// history turn by turn, so per-payload budgets alone cannot bound the sum.
+// The threshold is a fraction of the model window itself; bootstrap replays
+// are capped strictly below it (see bootstrapInputMaxTokens) so a freshly
+// recycled session can never immediately re-trigger recycling.
+const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
+const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
+// Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
+// Undershooting chars-per-token overflows the upstream window (fatal);
+// overshooting only truncates earlier, so estimate conservatively everywhere
+// budgets and recycle projections are computed.
+const ESTIMATE_CHARS_PER_TOKEN = 3;
+const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
+  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
+const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
+  /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
 
 function noop() {}
+
+function signalChildProcessTree(child, signal) {
+  if (!child) {
+    return false;
+  }
+
+  let signaled = false;
+  if (SUPPORTS_PROCESS_GROUP_SIGNALS && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, signal);
+      signaled = true;
+    } catch {
+      // Fall back to the direct child for launchers that are not process-group leaders.
+    }
+  }
+
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return signaled;
+  }
+
+  try {
+    return child.kill(signal) || signaled;
+  } catch {
+    return signaled;
+  }
+}
+
+function childProcessTreeExists(child) {
+  if (!child) {
+    return false;
+  }
+
+  if (SUPPORTS_PROCESS_GROUP_SIGNALS && Number.isInteger(child.pid)) {
+    try {
+      process.kill(-child.pid, 0);
+      return true;
+    } catch (error) {
+      return error?.code === 'EPERM';
+    }
+  }
+
+  return child.exitCode === null && child.signalCode === null;
+}
 
 function numberOrDefault(value, defaultValue) {
   if (value === null || value === undefined) {
@@ -202,18 +281,47 @@ function requestFingerprint(requestBody) {
   );
 }
 
-function normalizeUsage(tokenUsage) {
-  const source = tokenUsage?.total || tokenUsage?.last || {};
+function usageField(source, camelKey, snakeKey) {
+  const value = Number(source?.[camelKey] ?? source?.[snakeKey] ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function addPositiveUsageField(usage, key, value) {
+  if (value > 0) {
+    usage[key] = value;
+  }
+}
+
+function normalizeUsageBreakdown(source) {
+  const inputTokens = usageField(source, 'inputTokens', 'input_tokens');
+  const cachedInputTokens = usageField(source, 'cachedInputTokens', 'cached_input_tokens');
+  const outputTokens = usageField(source, 'outputTokens', 'output_tokens');
+  const reasoningOutputTokens = usageField(
+    source,
+    'reasoningOutputTokens',
+    'reasoning_output_tokens'
+  );
+  const totalTokens = usageField(source, 'totalTokens', 'total_tokens');
   const normalized = {
-    input_tokens: source.inputTokens || 0,
-    output_tokens: source.outputTokens || 0,
+    input_tokens: Math.max(0, inputTokens - cachedInputTokens),
+    output_tokens: outputTokens + reasoningOutputTokens,
   };
 
-  if ((source.cachedInputTokens || 0) > 0) {
-    normalized.cache_read_input_tokens = source.cachedInputTokens;
-  }
+  addPositiveUsageField(normalized, 'cache_read_input_tokens', cachedInputTokens);
+  addPositiveUsageField(normalized, 'reasoning_output_tokens', reasoningOutputTokens);
+  addPositiveUsageField(normalized, 'total_tokens', totalTokens);
 
   return normalized;
+}
+
+function normalizeCodexTokenUsage(tokenUsage) {
+  const total = tokenUsage?.total ? normalizeUsageBreakdown(tokenUsage.total) : null;
+  const last = tokenUsage?.last ? normalizeUsageBreakdown(tokenUsage.last) : null;
+  return {
+    total,
+    last,
+    model_context_window: tokenUsage?.modelContextWindow || null,
+  };
 }
 
 function emptyUsage() {
@@ -223,12 +331,170 @@ function emptyUsage() {
   };
 }
 
+function usageNumber(usage, key) {
+  const value = Number(usage?.[key] || 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function contextTokensFromUsage(usage) {
+  if (!usage) {
+    return 0;
+  }
+
+  // Prefer the app-server's own total for the turn; fall back to summing the
+  // components (input + cached input is the full context the model was fed,
+  // output approximates the thread context after the turn).
+  const total = usageNumber(usage, 'total_tokens');
+  if (total > 0) {
+    return total;
+  }
+
+  return (
+    usageNumber(usage, 'input_tokens') +
+    usageNumber(usage, 'cache_read_input_tokens') +
+    usageNumber(usage, 'output_tokens')
+  );
+}
+
+function estimateIncomingRequestTokens(requestBody) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  const latest = messages.at(-1);
+  if (!latest) {
+    return 0;
+  }
+
+  try {
+    return estimateTokensFromJson(latest.content ?? '');
+  } catch {
+    return 0;
+  }
+}
+
+function codexRecycleContextLimit(config, contextWindow) {
+  const window = Number(contextWindow || 0);
+  const base = window > 0 ? window : codexInputMaxTokens(config);
+  if (!Number.isFinite(base)) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.floor(base * CODEX_SESSION_RECYCLE_FRACTION);
+}
+
+function usageDelta(current, baseline) {
+  // Codex app-server totals are expected to be monotonic; clamp anyway so compaction
+  // or replay quirks cannot surface negative Anthropic usage.
+  const inputTokens = Math.max(
+    0,
+    usageNumber(current, 'input_tokens') - usageNumber(baseline, 'input_tokens')
+  );
+  const outputTokens = Math.max(
+    0,
+    usageNumber(current, 'output_tokens') - usageNumber(baseline, 'output_tokens')
+  );
+  const delta = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  const cacheReadInputTokens = Math.max(
+    0,
+    usageNumber(current, 'cache_read_input_tokens') -
+      usageNumber(baseline, 'cache_read_input_tokens')
+  );
+  addPositiveUsageField(delta, 'cache_read_input_tokens', cacheReadInputTokens);
+
+  const reasoningOutputTokens = Math.max(
+    0,
+    usageNumber(current, 'reasoning_output_tokens') -
+      usageNumber(baseline, 'reasoning_output_tokens')
+  );
+  addPositiveUsageField(delta, 'reasoning_output_tokens', reasoningOutputTokens);
+
+  const totalTokens = Math.max(
+    0,
+    usageNumber(current, 'total_tokens') - usageNumber(baseline, 'total_tokens')
+  );
+  addPositiveUsageField(delta, 'total_tokens', totalTokens);
+
+  return delta;
+}
+
+function addUsage(left, right) {
+  const inputTokens = usageNumber(left, 'input_tokens') + usageNumber(right, 'input_tokens');
+  const outputTokens = usageNumber(left, 'output_tokens') + usageNumber(right, 'output_tokens');
+  const total = {
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+  };
+
+  const cacheReadInputTokens =
+    usageNumber(left, 'cache_read_input_tokens') +
+    usageNumber(right, 'cache_read_input_tokens');
+  addPositiveUsageField(total, 'cache_read_input_tokens', cacheReadInputTokens);
+
+  const reasoningOutputTokens =
+    usageNumber(left, 'reasoning_output_tokens') +
+    usageNumber(right, 'reasoning_output_tokens');
+  addPositiveUsageField(total, 'reasoning_output_tokens', reasoningOutputTokens);
+
+  const totalTokens = usageNumber(left, 'total_tokens') + usageNumber(right, 'total_tokens');
+  addPositiveUsageField(total, 'total_tokens', totalTokens);
+
+  return total;
+}
+
 function estimateTokensFromJson(value) {
-  return Math.max(1, Math.ceil(JSON.stringify(value).length / 4));
+  return estimateTokensFromText(JSON.stringify(value));
 }
 
 function estimateTokensFromText(text) {
-  return Math.max(1, Math.ceil(String(text || '').length / 4));
+  return Math.max(1, Math.ceil(String(text || '').length / ESTIMATE_CHARS_PER_TOKEN));
+}
+
+function maxCharsForTokenBudget(maxTokens) {
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.floor(maxTokens * ESTIMATE_CHARS_PER_TOKEN));
+}
+
+function limitTextByTokenBudget(text, maxTokens) {
+  const value = String(text || '');
+  const maxChars = maxCharsForTokenBudget(maxTokens);
+  if (!Number.isFinite(maxChars) || value.length <= maxChars) {
+    return value;
+  }
+
+  const marker = `\n\n${INPUT_TRUNCATION_NOTICE}\n\n`;
+  if (marker.length >= maxChars) {
+    return value.slice(-maxChars);
+  }
+
+  const remainingChars = maxChars - marker.length;
+  const headChars = Math.ceil(remainingChars / 2);
+  const tailChars = Math.floor(remainingChars / 2);
+  return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
+}
+
+function codexInputMaxTokens(config) {
+  const maxTokens = numberOrDefault(config?.codex?.inputMaxTokens, DEFAULT_INPUT_MAX_TOKENS);
+  if (maxTokens <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxTokens));
+}
+
+function effectiveCodexInputMaxTokens(config, contextWindow) {
+  const configured = codexInputMaxTokens(config);
+  const window = Number(contextWindow || 0);
+  if (window <= 0) {
+    return configured;
+  }
+
+  const fromWindow = Math.max(1, Math.floor(window * CODEX_WINDOW_INPUT_FRACTION));
+  return Math.min(configured, fromWindow);
 }
 
 function populateEstimatedUsage(boundary, requestBody, outcome) {
@@ -281,16 +547,17 @@ function hasMatchingToolResult(requestBody, pendingToolCall) {
   return false;
 }
 
-function createBoundary(turnId, requestBody, initialUsage = emptyUsage()) {
+function createBoundary(turnId, requestBody, usageBaseline = emptyUsage()) {
   const listeners = new Set();
   const boundary = {
     turnId,
     requestFingerprint: requestFingerprint(requestBody),
     events: [],
     text: '',
-    usage: {
+    usage: emptyUsage(),
+    usageBaseline: {
       ...emptyUsage(),
-      ...(initialUsage || {}),
+      ...(usageBaseline || {}),
     },
     deltaItemIds: new Set(),
     finished: false,
@@ -395,27 +662,132 @@ function renderTranscriptBlock(block) {
   return '';
 }
 
-function renderTranscriptInput(requestBody) {
-  const parts = [];
+function renderMessageTranscript(message) {
+  if (message?.role === 'system') {
+    return '';
+  }
+
+  const content = normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`)
+    .map(renderTranscriptBlock)
+    .filter(Boolean)
+    .join('\n\n');
+  if (!content) {
+    return '';
+  }
+
+  return `[${message.role || 'unknown'}]\n${content}`;
+}
+
+function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message?.role !== 'user') {
+      continue;
+    }
+
+    const rendered = renderMessageTranscript(message);
+    if (rendered) {
+      return limitTextByTokenBudget(rendered, maxTokens);
+    }
+
+    break;
+  }
+
+  return limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
+}
+
+function fitTranscriptInputToBudget(selectedMessages, omittedCount, maxTokens) {
+  if (omittedCount <= 0) {
+    return limitTextByTokenBudget(joinTextParts(selectedMessages), maxTokens);
+  }
+
+  const notice = `${TRANSCRIPT_OMISSION_NOTICE}: ${omittedCount} message(s).`;
+  const maxChars = maxCharsForTokenBudget(maxTokens);
+  if (!Number.isFinite(maxChars)) {
+    return joinTextParts([notice, ...selectedMessages]);
+  }
+
+  const remainingMessages = selectedMessages.slice();
+  let input = joinTextParts([notice, ...remainingMessages]);
+  while (remainingMessages.length > 1 && input.length > maxChars) {
+    remainingMessages.shift();
+    input = joinTextParts([notice, ...remainingMessages]);
+  }
+
+  if (input.length <= maxChars) {
+    return input;
+  }
+
+  const latestMessage = remainingMessages.at(-1) || '';
+  const prefix = `${notice}\n\n`;
+  if (prefix.length >= maxChars) {
+    return prefix.slice(0, maxChars);
+  }
+
+  return `${prefix}${latestMessage.slice(-(maxChars - prefix.length))}`;
+}
+
+function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+  const renderedMessages = [];
   const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
 
   for (const message of messages) {
-    if (message?.role === 'system') {
+    const rendered = renderMessageTranscript(message);
+    if (!rendered) {
       continue;
     }
 
-    const content = normalizeContentBlocks(message?.content, `${message?.role || 'message'} content`)
-      .map(renderTranscriptBlock)
-      .filter(Boolean)
-      .join('\n\n');
-    if (!content) {
-      continue;
-    }
-
-    parts.push(`[${message.role || 'unknown'}]\n${content}`);
+    renderedMessages.push(rendered);
   }
 
-  return joinTextParts(parts) || extractLatestUserText(requestBody);
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    return joinTextParts(renderedMessages) || extractLatestUserText(requestBody);
+  }
+
+  const selected = [];
+  let usedTokens = 0;
+  let omittedCount = 0;
+  for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
+    const rendered = renderedMessages[index];
+    const tokens = estimateTokensFromText(rendered);
+    if (usedTokens + tokens <= maxTokens) {
+      selected.unshift(rendered);
+      usedTokens += tokens;
+      continue;
+    }
+
+    if (selected.length === 0) {
+      selected.unshift(limitTextByTokenBudget(rendered, maxTokens));
+      omittedCount = index;
+    } else {
+      omittedCount = index + 1;
+    }
+    break;
+  }
+
+  if (selected.length > 0) {
+    return fitTranscriptInputToBudget(selected, omittedCount, maxTokens);
+  }
+
+  return renderLatestUserTranscriptInput(requestBody, maxTokens);
+}
+
+function isCodexContextWindowError(error) {
+  return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
+}
+
+function isPossibleCodexContextWindowError(error) {
+  if (isCodexContextWindowError(error)) {
+    return false;
+  }
+
+  return (
+    error instanceof GatewayError &&
+    error.status === 502 &&
+    CODEX_CONTEXT_WINDOW_DRIFT_PATTERN.test(error.message || '')
+  );
 }
 
 function extractToolResultPayload(requestBody, pendingToolCall) {
@@ -488,6 +860,20 @@ function buildForkSessionKey(baseKey, fingerprint) {
   return `${baseKey}:fork:${fingerprint}`;
 }
 
+function requestHeader(req, name) {
+  return String(req.get(name) || '').trim();
+}
+
+function isClaudeWorkflowAgentRequest(req) {
+  const agentId = requestHeader(req, 'x-claude-code-agent-id');
+  const parentAgentId = requestHeader(req, 'x-claude-code-parent-agent-id');
+  return Boolean(agentId || parentAgentId);
+}
+
+function codexThreadSourceForRequest(req) {
+  return isClaudeWorkflowAgentRequest(req) ? 'subagent' : 'user';
+}
+
 function traceLog(tracer, event, details = {}) {
   tracer?.log?.(event, details);
 }
@@ -535,6 +921,7 @@ class CodexAppServerConnection extends EventEmitter {
     super();
     this.config = config;
     this.child = null;
+    this.stopPromise = null;
     this.buffer = '';
     this.nextRequestId = 1;
     this.pendingRequests = new Map();
@@ -557,6 +944,7 @@ class CodexAppServerConnection extends EventEmitter {
   async start() {
     this.child = spawn(this.config.codex.command, ['app-server'], {
       cwd: this.config.codex.cwd,
+      detached: SUPPORTS_PROCESS_GROUP_SIGNALS,
       env: {
         ...process.env,
       },
@@ -766,6 +1154,7 @@ class CodexAppServerConnection extends EventEmitter {
 
   async close(reason = null) {
     if (this.closed) {
+      await this.stopChild();
       return;
     }
 
@@ -787,21 +1176,25 @@ class CodexAppServerConnection extends EventEmitter {
   }
 
   async stopChild() {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
+
     const child = this.child;
-    if (!child || child.exitCode !== null || child.signalCode !== null) {
+    if (!child) {
       return;
     }
 
-    await new Promise((resolve) => {
+    this.stopPromise = new Promise((resolve) => {
       let settled = false;
+      const childAlreadyExited = child.exitCode !== null || child.signalCode !== null;
       const killTimer = setTimeout(function killStubbornChild() {
-        try {
-          child.kill('SIGKILL');
-        } catch {
+        const killSignaled = signalChildProcessTree(child, 'SIGKILL');
+        const childExited = child.exitCode !== null || child.signalCode !== null;
+        if (childAlreadyExited || childExited || !killSignaled) {
           finish();
         }
       }, this.closeKillTimeoutMs);
-      killTimer.unref?.();
 
       function finish() {
         if (settled) {
@@ -809,22 +1202,31 @@ class CodexAppServerConnection extends EventEmitter {
         }
         settled = true;
         clearTimeout(killTimer);
-        child.off('close', finish);
+        child.off('close', finishWhenProcessTreeExited);
         resolve();
       }
 
-      child.once('close', finish);
-      try {
-        child.kill('SIGTERM');
-      } catch {
+      function finishWhenProcessTreeExited() {
+        if (childProcessTreeExists(child)) {
+          return;
+        }
+        finish();
+      }
+
+      if (!childAlreadyExited) {
+        child.once('close', finishWhenProcessTreeExited);
+      }
+      if (!signalChildProcessTree(child, 'SIGTERM')) {
         finish();
       }
     });
+
+    return this.stopPromise;
   }
 }
 
 class CodexGatewaySession {
-  constructor(config, route, req, requestBody, sessionKey = null, tracer = null) {
+  constructor(config, route, req, requestBody, sessionKey = null, tracer = null, options = {}) {
     this.config = config;
     this.route = route;
     this.requestedModel = route.requestedModel;
@@ -844,16 +1246,25 @@ class CodexGatewaySession {
     }) || null;
     this.systemPrompt = renderSystemPrompt(requestBody);
     this.connection = new CodexAppServerConnection(config);
+    this.bootstrapMode = options.bootstrapMode || '';
+    // Shared per-upstream-model context windows learned from app-server usage
+    // events, provided by the owning session manager.
+    this.contextWindows = options.contextWindows || null;
+    this.threadSource = codexThreadSourceForRequest(req);
+    this.ephemeralThread = this.threadSource === 'subagent';
     this.threadId = null;
     this.pendingToolCall = null;
     this.activeBoundary = null;
-    this.latestUsage = emptyUsage();
+    this.routingReservation = null;
+    this.latestTotalUsage = emptyUsage();
     this.idleTimer = null;
     this.lastUsedAt = Date.now();
     this.disposed = false;
 
     traceLog(this.tracer, 'codex.session.created', {
       tool_count: this.effectiveTools.length,
+      thread_source: this.threadSource,
+      ephemeral_thread: this.ephemeralThread,
     });
   }
 
@@ -889,15 +1300,63 @@ class CodexGatewaySession {
   }
 
   isIdle() {
-    return !this.activeBoundary || this.activeBoundary.finished;
+    return !this.routingReservation && (!this.activeBoundary || this.activeBoundary.finished);
   }
 
   isDisposableIdle() {
-    return !this.pendingToolCall && this.isIdle();
+    return !this.routingReservation && !this.pendingToolCall && this.isIdle();
   }
 
   isForkSession() {
     return this.sessionKey !== this.baseSessionKey;
+  }
+
+  knownModelContextWindow() {
+    const own = Number(this.modelContextWindow || 0);
+    if (own > 0) {
+      return own;
+    }
+
+    const shared = Number(this.contextWindows?.get(this.route.upstreamModel) || 0);
+    return shared > 0 ? shared : 0;
+  }
+
+  inputMaxTokens() {
+    return effectiveCodexInputMaxTokens(this.config, this.knownModelContextWindow());
+  }
+
+  bootstrapInputMaxTokens() {
+    const budget = this.inputMaxTokens();
+    const recycleLimit = codexRecycleContextLimit(this.config, this.knownModelContextWindow());
+    if (!Number.isFinite(recycleLimit)) {
+      return budget;
+    }
+
+    // Keep bootstrap transcript replays strictly below the recycle threshold
+    // so a freshly recycled session cannot land above it and thrash into
+    // recycling again on its next turn.
+    return Math.min(budget, Math.max(1, Math.floor(recycleLimit * CODEX_BOOTSTRAP_RECYCLE_HEADROOM)));
+  }
+
+  initialInputMode() {
+    if (this.bootstrapMode) {
+      return this.bootstrapMode;
+    }
+
+    if (this.isForkSession()) {
+      return 'latest';
+    }
+
+    return 'transcript';
+  }
+
+  initialTurnInput(requestBody) {
+    const maxTokens = this.bootstrapInputMaxTokens();
+    if (this.initialInputMode() === 'latest') {
+      return renderLatestUserTranscriptInput(requestBody, maxTokens);
+    }
+
+    return renderTranscriptInput(requestBody, maxTokens);
   }
 
   assertCompatible(route, requestBody, options = {}) {
@@ -947,6 +1406,8 @@ class CodexGatewaySession {
       developerInstructions: this.systemPrompt || null,
       dynamicTools: this.toolRegistry.dynamicTools,
       serviceName: 'ultrathink_gateway',
+      threadSource: this.threadSource,
+      ...(this.ephemeralThread ? { ephemeral: true } : {}),
     });
 
     this.threadId = result.thread?.id || null;
@@ -956,16 +1417,17 @@ class CodexGatewaySession {
 
     traceLog(this.tracer, 'codex.thread.started', {
       thread_id: this.threadId,
+      thread_source: this.threadSource,
+      ephemeral_thread: this.ephemeralThread,
     });
   }
 
   async startTurn(requestBody) {
     const threadExists = Boolean(this.threadId);
     await this.ensureThread();
-    this.latestUsage = emptyUsage();
     const latestUserText = threadExists
-      ? extractLatestUserText(requestBody)
-      : renderTranscriptInput(requestBody);
+      ? limitTextByTokenBudget(extractLatestUserText(requestBody), this.inputMaxTokens())
+      : this.initialTurnInput(requestBody);
     const result = await this.connection.request('turn/start', {
       threadId: this.threadId,
       input: [
@@ -990,7 +1452,11 @@ class CodexGatewaySession {
       throw new GatewayError(500, 'api_error', 'no pending Codex tool call exists');
     }
 
-    const toolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const toolResult = {
+      ...rawToolResult,
+      text: limitTextByTokenBudget(rawToolResult.text, this.inputMaxTokens()),
+    };
     const tracer = this.scopedTracer(requestTracer);
     traceLog(tracer, 'codex.tool_result.continued', {
       call_id: this.pendingToolCall.callId,
@@ -1013,7 +1479,7 @@ class CodexGatewaySession {
 
     const turnId = this.pendingToolCall.turnId;
     this.pendingToolCall = null;
-    const boundary = createBoundary(turnId, requestBody, this.latestUsage);
+    const boundary = createBoundary(turnId, requestBody, this.latestTotalUsage);
     this.activeBoundary = boundary;
     return this.beginBoundary(boundary, turnId, requestBody, requestTracer);
   }
@@ -1082,7 +1548,7 @@ class CodexGatewaySession {
       return this.continuePendingToolCall(requestBody, requestTracer);
     }
 
-    const boundary = createBoundary(null, requestBody, this.latestUsage);
+    const boundary = createBoundary(null, requestBody, this.latestTotalUsage);
     this.activeBoundary = boundary;
 
     try {
@@ -1243,11 +1709,32 @@ class CodexGatewaySession {
         message.params?.turnId === turnId &&
         (message.params?.tokenUsage?.total || message.params?.tokenUsage?.last)
       ) {
-        boundary.usage = normalizeUsage(message.params.tokenUsage);
-        this.latestUsage = boundary.usage;
+        const tokenUsage = normalizeCodexTokenUsage(message.params.tokenUsage);
+        if (tokenUsage.total) {
+          boundary.usage = usageDelta(tokenUsage.total, boundary.usageBaseline);
+          this.latestTotalUsage = tokenUsage.total;
+        } else {
+          boundary.usage = tokenUsage.last || emptyUsage();
+          this.latestTotalUsage = addUsage(boundary.usageBaseline, boundary.usage);
+        }
+        if (tokenUsage.model_context_window) {
+          this.modelContextWindow = tokenUsage.model_context_window;
+          this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
+        }
+        // Prefer the per-turn snapshot (tracks shrinkage after app-server
+        // compaction); fall back to the cumulative total, which overestimates
+        // live context — the safe direction for recycle pressure.
+        this.latestContextTokens =
+          contextTokensFromUsage(tokenUsage.last) ||
+          contextTokensFromUsage(tokenUsage.total) ||
+          this.latestContextTokens ||
+          0;
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,
           usage: boundary.usage,
+          total_usage: tokenUsage.total,
+          last_usage: tokenUsage.last,
+          model_context_window: tokenUsage.model_context_window,
         });
         boundary.emit({
           type: 'usage',
@@ -1423,10 +1910,11 @@ export class CodexSessionManager {
     this.config = config;
     this.sessions = new Map();
     this.tracer = options.tracer || null;
+    this.learnedContextWindows = new Map();
     this.createSession =
       typeof options.createSession === 'function'
         ? options.createSession
-        : (route, req, requestBody, sessionKey, requestTracer = null) =>
+        : (route, req, requestBody, sessionKey, requestTracer = null, sessionOptions = {}) =>
             new CodexGatewaySession(
               this.config,
               route,
@@ -1436,7 +1924,11 @@ export class CodexSessionManager {
               (requestTracer || this.tracer)?.scope?.({
                 requested_model: route.requestedModel,
                 upstream_model: route.upstreamModel,
-              }) || null
+              }) || null,
+              {
+                contextWindows: this.learnedContextWindows,
+                ...sessionOptions,
+              }
             );
   }
 
@@ -1456,6 +1948,34 @@ export class CodexSessionManager {
     });
   }
 
+  hasRoutingReservation(session) {
+    return Boolean(session?.routingReservation);
+  }
+
+  reserveSessionForRequest(session, selection, requestTracer = null) {
+    if (!session || NON_RESERVING_SELECTION_REASONS.has(selection.selectionReason)) {
+      return null;
+    }
+
+    const reservation = {
+      requestFingerprint: selection.requestFingerprint,
+      createdAt: Date.now(),
+    };
+    session.routingReservation = reservation;
+    traceLog(requestTracer || this.tracer, 'codex.session.reserved', {
+      session_key: session.sessionKey,
+      selection_reason: selection.selectionReason,
+      request_fingerprint: selection.requestFingerprint,
+    });
+    return reservation;
+  }
+
+  clearSessionReservation(session, reservation) {
+    if (reservation && session?.routingReservation === reservation) {
+      session.routingReservation = null;
+    }
+  }
+
   resolveSessionEntry(req, requestBody, route) {
     const identityKey = buildSessionIdentityKey(route, req);
     const baseSessionKey = buildSessionBaseKey(route, req, requestBody);
@@ -1466,13 +1986,34 @@ export class CodexSessionManager {
 
     for (const [sessionKey, session] of identityEntries) {
       if (session.pendingToolCall && toolResultIds.has(session.pendingToolCall.callId)) {
-        return { sessionKey, session, selectionReason: 'matching_tool_result' };
+        return {
+          sessionKey,
+          session,
+          selectionReason: 'matching_tool_result',
+          requestFingerprint: requestIdFingerprint,
+        };
       }
     }
 
     for (const [sessionKey, session] of identityEntries) {
       if (session.activeBoundary?.requestFingerprint === requestIdFingerprint) {
-        return { sessionKey, session, selectionReason: 'boundary_replay' };
+        return {
+          sessionKey,
+          session,
+          selectionReason: 'boundary_replay',
+          requestFingerprint: requestIdFingerprint,
+        };
+      }
+    }
+
+    for (const [sessionKey, session] of identityEntries) {
+      if (session.routingReservation?.requestFingerprint === requestIdFingerprint) {
+        return {
+          sessionKey,
+          session,
+          selectionReason: 'routing_reservation_replay',
+          requestFingerprint: requestIdFingerprint,
+        };
       }
     }
 
@@ -1480,7 +2021,12 @@ export class CodexSessionManager {
       return sessionKey === baseSessionKey;
     });
     if (!canonical) {
-      return { sessionKey: baseSessionKey, session: null, selectionReason: 'new_canonical' };
+      return {
+        sessionKey: baseSessionKey,
+        session: null,
+        selectionReason: 'new_canonical',
+        requestFingerprint: requestIdFingerprint,
+      };
     }
 
     const [canonicalKey, canonicalSession] = canonical;
@@ -1490,6 +2036,7 @@ export class CodexSessionManager {
         sessionKey: forkSessionKey,
         session: this.sessions.get(forkSessionKey) || null,
         selectionReason: 'fork_pending_tool_call',
+        requestFingerprint: requestIdFingerprint,
       };
     }
 
@@ -1499,13 +2046,29 @@ export class CodexSessionManager {
         sessionKey: forkSessionKey,
         session: this.sessions.get(forkSessionKey) || null,
         selectionReason: 'fork_active_boundary',
+        requestFingerprint: requestIdFingerprint,
       };
     }
 
-    return { sessionKey: canonicalKey, session: canonicalSession, selectionReason: 'canonical' };
+    if (this.hasRoutingReservation(canonicalSession)) {
+      const forkSessionKey = buildForkSessionKey(baseSessionKey, requestIdFingerprint);
+      return {
+        sessionKey: forkSessionKey,
+        session: this.sessions.get(forkSessionKey) || null,
+        selectionReason: 'fork_routing_reservation',
+        requestFingerprint: requestIdFingerprint,
+      };
+    }
+
+    return {
+      sessionKey: canonicalKey,
+      session: canonicalSession,
+      selectionReason: 'canonical',
+      requestFingerprint: requestIdFingerprint,
+    };
   }
 
-  ensureSession(req, requestBody, route, requestTracer = null) {
+  ensureSessionEntry(req, requestBody, route, requestTracer = null, options = {}) {
     validateCodexRequestControls(requestBody);
     const selection = this.resolveSessionEntry(req, requestBody, route);
     let session = selection.session;
@@ -1515,10 +2078,39 @@ export class CodexSessionManager {
       upstream_model: route.upstreamModel,
       session_key: selection.sessionKey,
       selection_reason: selection.selectionReason,
+      request_fingerprint: selection.requestFingerprint,
     });
 
+    const pressure = session
+      ? this.contextPressureDecision(session, selection.selectionReason, requestBody)
+      : null;
+    if (pressure) {
+      traceLog(requestTracer || this.tracer, 'codex.session.recycled', {
+        session_key: selection.sessionKey,
+        selection_reason: selection.selectionReason,
+        context_tokens: pressure.contextTokens,
+        incoming_tokens: pressure.incomingTokens,
+        recycle_limit: pressure.limit,
+        model_context_window: session.knownModelContextWindow?.() || null,
+      });
+      this.sessions.delete(selection.sessionKey);
+      void session.close(new Error('recycled before Codex context window overflow'));
+      session = null;
+      // The replacement must replay the bounded transcript even under a fork
+      // session key, whose default bootstrap mode ('latest') would silently
+      // drop all prior context.
+      options = { ...options, bootstrapMode: 'transcript' };
+    }
+
     if (!session) {
-      session = this.createSession(route, req, requestBody, selection.sessionKey, requestTracer);
+      session = this.createSession(
+        route,
+        req,
+        requestBody,
+        selection.sessionKey,
+        requestTracer,
+        options
+      );
       this.sessions.set(selection.sessionKey, session);
       this.watchSession(selection.sessionKey, session);
     } else {
@@ -1528,28 +2120,228 @@ export class CodexSessionManager {
     }
 
     session.clearIdleTimer?.();
-    return session;
+    return {
+      ...selection,
+      session,
+    };
+  }
+
+  ensureSession(req, requestBody, route, requestTracer = null) {
+    return this.ensureSessionEntry(req, requestBody, route, requestTracer).session;
+  }
+
+  prepareSessionRequest(req, requestBody, route, requestTracer = null, options = {}) {
+    const selection = this.ensureSessionEntry(req, requestBody, route, requestTracer, options);
+    return {
+      ...selection,
+      reservation: this.reserveSessionForRequest(selection.session, selection, requestTracer),
+    };
   }
 
   async processRequest(req, requestBody, route, requestTracer = null) {
-    const session = this.ensureSession(req, requestBody, route, requestTracer);
-    return this.runSessionRequest(
-      session,
-      function advanceSession() {
+    return this.runRecoverableSessionRequest({
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      run(session) {
         return session.advance(requestBody, requestTracer);
       },
-      req.abortSignal
-    );
+    });
   }
 
   async streamRequest(req, requestBody, route, onEvent, requestTracer = null) {
-    const session = this.ensureSession(req, requestBody, route, requestTracer);
+    let forwardedEventCount = 0;
+    function retryAwareOnEvent(event) {
+      forwardedEventCount += 1;
+      return onEvent(event);
+    }
+
+    return this.runRecoverableSessionRequest({
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      canRetry() {
+        return forwardedEventCount === 0;
+      },
+      run(session) {
+        return session.stream(requestBody, retryAwareOnEvent, requestTracer);
+      },
+    });
+  }
+
+  async runRecoverableSessionRequest(options) {
+    // Shared across retry attempts (spread copies keep the same reference) so
+    // overflow diagnostics always describe the most recently prepared session.
+    options.attemptState = options.attemptState || {};
+    let lastError = null;
+    try {
+      return await this.runPreparedSessionRequest(options);
+    } catch (error) {
+      if (!this.canRecoverFromContextOverflow(error, options)) {
+        this.traceContextRecoverySkipped(error, options);
+        throw this.describeContextOverflowError(error, options);
+      }
+      lastError = error;
+    }
+
+    // Recover on a fresh thread: first with the bounded full-transcript replay
+    // (keeps context; fits the adaptive budget), then with latest-only input.
+    // When the failed attempt was itself a fresh transcript bootstrap, a
+    // transcript retry would re-send byte-identical input and deterministically
+    // fail again, so skip straight to latest-only.
+    const failedSession = options.attemptState.lastPreparedSession || null;
+    const failedFreshTranscriptBootstrap =
+      failedSession &&
+      Number(failedSession.latestContextTokens || 0) === 0 &&
+      failedSession.initialInputMode?.() === 'transcript';
+    const recoveryModes = failedFreshTranscriptBootstrap
+      ? ['latest']
+      : ['transcript', 'latest'];
+
+    for (const bootstrapMode of recoveryModes) {
+      traceLog(options.requestTracer || this.tracer, 'codex.session.context_recovery_retry', {
+        bootstrap_mode: bootstrapMode,
+        error_message: lastError?.message || String(lastError),
+      });
+
+      try {
+        return await this.runPreparedSessionRequest({
+          ...options,
+          sessionOptions: {
+            ...(options.sessionOptions || {}),
+            bootstrapMode,
+          },
+        });
+      } catch (error) {
+        if (!this.canRecoverFromContextOverflow(error, options)) {
+          this.traceContextRecoverySkipped(error, options);
+          throw this.describeContextOverflowError(error, options);
+        }
+        lastError = error;
+      }
+    }
+
+    throw this.describeContextOverflowError(lastError, options);
+  }
+
+  describeContextOverflowError(error, options) {
+    if (!isCodexContextWindowError(error)) {
+      return error;
+    }
+
+    const session = options.attemptState?.lastPreparedSession || null;
+    const contextTokens = Number(session?.latestContextTokens || 0);
+    const window = Number(session?.knownModelContextWindow?.() || 0);
+    const budget = session ? session.inputMaxTokens() : codexInputMaxTokens(this.config);
+    const details = [
+      contextTokens > 0 ? `session context ~${contextTokens} tokens` : null,
+      window > 0 ? `model window ${window} tokens` : null,
+      Number.isFinite(budget) ? `gateway input budget ${budget} tokens` : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+
+    return new GatewayError(
+      400,
+      'invalid_request_error',
+      `Codex context window exceeded${details ? ` (${details})` : ''}: ${error?.message || String(error)}`
+    );
+  }
+
+  traceContextRecoverySkipped(error, options) {
+    const tracer = options.requestTracer || this.tracer;
+    if (isCodexContextWindowError(error)) {
+      traceLog(tracer, 'codex.session.context_recovery_skipped', {
+        error_message: error?.message || String(error),
+        aborted: options.req?.abortSignal?.aborted === true,
+      });
+      return;
+    }
+
+    if (isPossibleCodexContextWindowError(error)) {
+      traceLog(tracer, 'codex.session.context_recovery_unmatched', {
+        error_message: error?.message || String(error),
+        gateway_error_status: error.status,
+        gateway_error_type: error.type,
+      });
+    }
+  }
+
+  recycleContextTokenLimit(session) {
+    return codexRecycleContextLimit(this.config, session?.knownModelContextWindow?.() || 0);
+  }
+
+  contextPressureDecision(session, selectionReason, requestBody = null) {
+    // Only recycle when the session is between turns: a fresh replacement is
+    // bootstrapped from the bounded transcript replay, the same path used
+    // when an idle-expired session receives a follow-up tool result.
+    if (!RECYCLE_ELIGIBLE_SELECTION_REASONS.has(selectionReason)) {
+      return null;
+    }
+
+    if (session.routingReservation) {
+      return null;
+    }
+
+    if (session.activeBoundary && !session.activeBoundary.finished) {
+      return null;
+    }
+
+    const contextTokens = Number(session.latestContextTokens || 0);
+    if (contextTokens <= 0) {
+      return null;
+    }
+
+    // Project the incoming payload on top of the live context so a single
+    // oversized tool result cannot leap past the window in one turn.
+    const limit = this.recycleContextTokenLimit(session);
+    const incomingTokens = estimateIncomingRequestTokens(requestBody);
+    if (contextTokens + incomingTokens < limit) {
+      return null;
+    }
+
+    return { contextTokens, incomingTokens, limit };
+  }
+
+  canRecoverFromContextOverflow(error, options) {
+    if (!isCodexContextWindowError(error)) {
+      return false;
+    }
+
+    if (options.req?.abortSignal?.aborted) {
+      return false;
+    }
+
+    if (typeof options.canRetry === 'function' && !options.canRetry()) {
+      return false;
+    }
+
+    return true;
+  }
+
+  async runPreparedSessionRequest(options) {
+    const { req, requestBody, route, requestTracer, sessionOptions = {} } = options;
+    const { session, reservation } = this.prepareSessionRequest(
+      req,
+      requestBody,
+      route,
+      requestTracer,
+      sessionOptions
+    );
+    if (!options.attemptState) {
+      options.attemptState = {};
+    }
+    options.attemptState.lastPreparedSession = session;
+
     return this.runSessionRequest(
       session,
-      function streamSession() {
-        return session.stream(requestBody, onEvent, requestTracer);
+      function runSession() {
+        return options.run(session);
       },
-      req.abortSignal
+      req.abortSignal,
+      reservation
     );
   }
 
@@ -1566,7 +2358,7 @@ export class CodexSessionManager {
 
   isEvictableFailure(error) {
     if (error instanceof GatewayError) {
-      return error.status >= 499;
+      return error.status >= 499 || isCodexContextWindowError(error);
     }
 
     return true;
@@ -1597,7 +2389,7 @@ export class CodexSessionManager {
     });
   }
 
-  async runSessionRequest(session, run, signal) {
+  async runSessionRequest(session, run, signal, reservation = null) {
     try {
       return await this.runWithAbort(session, run, signal);
     } catch (error) {
@@ -1606,6 +2398,7 @@ export class CodexSessionManager {
       }
       throw error;
     } finally {
+      this.clearSessionReservation(session, reservation);
       this.armIdleTimer(session);
     }
   }
@@ -1667,7 +2460,15 @@ export class CodexSessionManager {
         return;
       }
 
-      Promise.resolve().then(run).then(
+      let runPromise = null;
+      try {
+        runPromise = Promise.resolve(run());
+      } catch (error) {
+        settle(reject, error);
+        return;
+      }
+
+      runPromise.then(
         function resolveRequest(value) {
           settle(resolve, value);
         },

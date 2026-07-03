@@ -1,16 +1,21 @@
 import express from 'express';
+import { ProxyAgent, fetch as undiciFetch } from 'undici';
 
 import {
   estimateAnthropicInputTokens,
   formatAnthropicError,
   mapOpenAiFinishReason,
-  translateAnthropicMessagesRequest,
+  translateAnthropicMessagesRequestWithOptions,
   translateOpenAiResponseToAnthropic,
 } from './anthropic-format.js';
 import { isGatewayLoopbackHost, loadGatewayConfig } from './config.js';
 import { CodexSessionManager } from './codex-provider.js';
 import { GatewayError, listGatewayModels, resolveModelRoute } from './model-routing.js';
+import { proxyUrlForTarget } from './proxy.js';
 import { createGatewayTracer } from './trace.js';
+
+const proxyDispatchers = new Map();
+const TOOL_REASONING_CACHE_MAX_ENTRIES = 2_048;
 
 export function assertGatewayBindIsSafe(config) {
   const host = config.host || '127.0.0.1';
@@ -128,11 +133,12 @@ async function safeJson(response) {
 
 async function postJson(url, headers, body, signal) {
   try {
-    return await fetch(url, {
+    return await undiciFetch(url, {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
       signal,
+      dispatcher: fetchDispatcherForUrl(url),
     });
   } catch (error) {
     if (signal?.aborted && signal.reason instanceof GatewayError) {
@@ -155,10 +161,119 @@ function gatewayUrl(baseUrl, relativePath) {
   return new URL(relativePath.replace(/^\/+/u, ''), base);
 }
 
-function createOpenAiHeaders(config) {
+function fetchDispatcherForUrl(url) {
+  const proxyUrl = proxyUrlForTarget(url);
+  if (!proxyUrl) {
+    return undefined;
+  }
+
+  const dispatcherUrl = normalizeProxyDispatcherUrl(proxyUrl);
+  if (!proxyDispatchers.has(dispatcherUrl)) {
+    proxyDispatchers.set(dispatcherUrl, new ProxyAgent(dispatcherUrl));
+  }
+
+  return proxyDispatchers.get(dispatcherUrl);
+}
+
+function normalizeProxyDispatcherUrl(proxyUrl) {
+  let parsed = null;
+  try {
+    parsed = new URL(proxyUrl);
+  } catch {
+    throw new GatewayError(
+      502,
+      'api_error',
+      'Invalid proxy URL configured for gateway upstream requests'
+    );
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new GatewayError(
+      502,
+      'api_error',
+      `Unsupported proxy URL scheme "${parsed.protocol}" for gateway upstream requests; configure an http:// or https:// proxy URL.`
+    );
+  }
+
+  return parsed.href;
+}
+
+function openAiCompatibleConfig(config, route) {
+  if (route.provider === 'deepseek') {
+    return config.deepseek;
+  }
+
+  return config.openai;
+}
+
+function createOpenAiCompatibleHeaders(config, route) {
+  const providerConfig = openAiCompatibleConfig(config, route);
   return upstreamHeaders({
-    authorization: `Bearer ${config.openai.apiKey}`,
+    authorization: `Bearer ${providerConfig.apiKey}`,
   });
+}
+
+function openAiCompatibleProviderLabel(route) {
+  if (route.provider === 'deepseek') {
+    return 'DeepSeek';
+  }
+
+  return 'OpenAI-compatible';
+}
+
+function toolReasoningCacheNamespace(req) {
+  return [
+    req.get('x-claude-code-session-id') || 'global',
+    req.get('x-claude-code-agent-id') || '',
+    req.get('x-claude-code-parent-agent-id') || '',
+  ].join('\x1f');
+}
+
+function rememberToolCallReasoning(cache, key, reasoningContent) {
+  if (!key || typeof reasoningContent !== 'string' || reasoningContent === '') {
+    return;
+  }
+
+  if (cache.has(key)) {
+    cache.delete(key);
+  }
+  cache.set(key, reasoningContent);
+
+  while (cache.size > TOOL_REASONING_CACHE_MAX_ENTRIES) {
+    const oldestKey = cache.keys().next().value;
+    cache.delete(oldestKey);
+  }
+}
+
+function openAiCompatibleTranslationOptions(req, route, toolReasoningCache) {
+  if (route.provider !== 'deepseek') {
+    return {};
+  }
+
+  const cacheNamespace = toolReasoningCacheNamespace(req);
+  function cacheKey(toolCallId) {
+    return `${cacheNamespace}\x1f${toolCallId}`;
+  }
+
+  return {
+    preserveAssistantThinking: true,
+    reasoningContentForToolCall(toolCallId) {
+      if (!toolCallId) {
+        return '';
+      }
+      return toolReasoningCache.get(cacheKey(toolCallId)) || '';
+    },
+    recordToolCallReasoning(toolCallId, reasoningContent) {
+      if (!toolCallId) {
+        return;
+      }
+      rememberToolCallReasoning(
+        toolReasoningCache,
+        cacheKey(toolCallId),
+        reasoningContent
+      );
+    },
+  };
 }
 
 function matchesGatewaySharedSecret(value, config) {
@@ -440,6 +555,7 @@ function createStreamState(requestedModel, fallbackId) {
     textBlockStarted: false,
     textBlockIndex: 0,
     toolCalls: new Map(),
+    reasoningContent: '',
     finishReason: null,
     usage: {
       input_tokens: 0,
@@ -504,6 +620,16 @@ function bufferToolCallDelta(toolCallDeltas, toolCalls) {
   }
 }
 
+function recordStreamingToolCallReasoning(state, translationOptions) {
+  if (!state.reasoningContent) {
+    return;
+  }
+
+  for (const toolCall of state.toolCalls.values()) {
+    translationOptions.recordToolCallReasoning?.(toolCall.id, state.reasoningContent);
+  }
+}
+
 async function closeTextBlock(res, state) {
   if (!state.textBlockStarted) {
     return;
@@ -565,10 +691,21 @@ async function flushToolUses(res, state) {
   }
 }
 
-async function streamOpenAiAsAnthropic(req, res, config, route, signal) {
-  const requestBody = translateAnthropicMessagesRequest(req.body, route);
-  const url = gatewayUrl(config.openai.baseUrl, 'chat/completions');
-  const upstream = await postJson(url, createOpenAiHeaders(config), requestBody, signal);
+async function streamOpenAiAsAnthropic(req, res, config, route, signal, toolReasoningCache) {
+  const translationOptions = openAiCompatibleTranslationOptions(req, route, toolReasoningCache);
+  const requestBody = translateAnthropicMessagesRequestWithOptions(
+    req.body,
+    route,
+    translationOptions
+  );
+  const providerConfig = openAiCompatibleConfig(config, route);
+  const url = gatewayUrl(providerConfig.baseUrl, 'chat/completions');
+  const upstream = await postJson(
+    url,
+    createOpenAiCompatibleHeaders(config, route),
+    requestBody,
+    signal
+  );
 
   if (!upstream.ok) {
     const body = await safeJson(upstream);
@@ -576,7 +713,9 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal) {
       type: 'error',
       error: {
         type: body?.error?.type || 'api_error',
-        message: body?.error?.message || `OpenAI upstream returned HTTP ${upstream.status}`,
+        message:
+          body?.error?.message ||
+          `${openAiCompatibleProviderLabel(route)} upstream returned HTTP ${upstream.status}`,
       },
     });
     return;
@@ -611,6 +750,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal) {
           if (dataLine === '[DONE]') {
             await closeTextBlock(res, state);
             await ensureTextBlockStartedNoText(res, state);
+            recordStreamingToolCallReasoning(state, translationOptions);
             await flushToolUses(res, state);
             await writeSseEvent(res, 'message_delta', {
               type: 'message_delta',
@@ -647,6 +787,9 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal) {
           if (choice.finish_reason) {
             state.finishReason = choice.finish_reason;
           }
+          if (choice.delta?.reasoning_content) {
+            state.reasoningContent += choice.delta.reasoning_content;
+          }
 
           if (choice.delta?.content) {
             await ensureTextBlockStarted(res, state);
@@ -673,6 +816,7 @@ async function streamOpenAiAsAnthropic(req, res, config, route, signal) {
 
   await closeTextBlock(res, state);
   await ensureTextBlockStartedNoText(res, state);
+  recordStreamingToolCallReasoning(state, translationOptions);
   await flushToolUses(res, state);
   await writeSseEvent(res, 'message_delta', {
     type: 'message_delta',
@@ -737,6 +881,19 @@ function normalizeCodexUsage(usage) {
   return normalized;
 }
 
+function usageValue(usage, key) {
+  return usage?.[key] || 0;
+}
+
+function sameUsage(left, right) {
+  return (
+    usageValue(left, 'input_tokens') === usageValue(right, 'input_tokens') &&
+    usageValue(left, 'output_tokens') === usageValue(right, 'output_tokens') &&
+    usageValue(left, 'cache_read_input_tokens') ===
+      usageValue(right, 'cache_read_input_tokens')
+  );
+}
+
 function outputOnlyUsage(usage) {
   return {
     input_tokens: 0,
@@ -763,10 +920,7 @@ function codexOutcomeToAnthropic(outcome, requestedModel) {
     content,
     stop_reason: outcome.type === 'tool_use' ? 'tool_use' : 'end_turn',
     stop_sequence: null,
-    usage: outcome.usage || {
-      input_tokens: 0,
-      output_tokens: 0,
-    },
+    usage: normalizeCodexUsage(outcome.usage),
   };
 }
 
@@ -826,11 +980,8 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
-    const unchanged =
-      emittedUsage &&
-      emittedUsage.input_tokens === state.usage.input_tokens &&
-      emittedUsage.output_tokens === state.usage.output_tokens;
+    state.usage = normalizeCodexUsage(usage);
+    const unchanged = emittedUsage && sameUsage(emittedUsage, state.usage);
     if (stopReason === null && unchanged) {
       return;
     }
@@ -852,7 +1003,7 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
+    state.usage = normalizeCodexUsage(usage);
     await closeTextBlock(res, state);
     await ensureTextBlockStartedNoText(res, state);
     const toolBlockIndex = state.textBlockIndex;
@@ -890,7 +1041,7 @@ function streamCodexResponse(
       return;
     }
 
-    state.usage = outputOnlyUsage(normalizeCodexUsage(usage));
+    state.usage = normalizeCodexUsage(usage);
     await closeTextBlock(res, state);
     await ensureTextBlockStartedNoText(res, state);
     await writeUsageDelta(usage, 'end_turn');
@@ -993,10 +1144,21 @@ function streamCodexResponse(
     .finally(stopHeartbeat);
 }
 
-async function handleOpenAiJson(req, res, config, route, signal) {
-  const requestBody = translateAnthropicMessagesRequest(req.body, route);
-  const url = gatewayUrl(config.openai.baseUrl, 'chat/completions');
-  const upstream = await postJson(url, createOpenAiHeaders(config), requestBody, signal);
+async function handleOpenAiJson(req, res, config, route, signal, toolReasoningCache) {
+  const translationOptions = openAiCompatibleTranslationOptions(req, route, toolReasoningCache);
+  const requestBody = translateAnthropicMessagesRequestWithOptions(
+    req.body,
+    route,
+    translationOptions
+  );
+  const providerConfig = openAiCompatibleConfig(config, route);
+  const url = gatewayUrl(providerConfig.baseUrl, 'chat/completions');
+  const upstream = await postJson(
+    url,
+    createOpenAiCompatibleHeaders(config, route),
+    requestBody,
+    signal
+  );
   const body = await safeJson(upstream);
 
   if (!upstream.ok) {
@@ -1004,7 +1166,9 @@ async function handleOpenAiJson(req, res, config, route, signal) {
       type: 'error',
       error: {
         type: body?.error?.type || 'api_error',
-        message: body?.error?.message || `OpenAI upstream returned HTTP ${upstream.status}`,
+        message:
+          body?.error?.message ||
+          `${openAiCompatibleProviderLabel(route)} upstream returned HTTP ${upstream.status}`,
       },
     });
     return;
@@ -1013,7 +1177,8 @@ async function handleOpenAiJson(req, res, config, route, signal) {
   res.json(translateOpenAiResponseToAnthropic(
     body,
     responseModelForRoute(config, route),
-    body?.id
+    body?.id,
+    translationOptions
   ));
 }
 
@@ -1050,6 +1215,7 @@ async function handleCountTokens(req, res, config, signal) {
       return;
     }
     case 'codex':
+    case 'deepseek':
     case 'openai':
       res.json({
         input_tokens: estimateAnthropicInputTokens(req.body),
@@ -1060,7 +1226,15 @@ async function handleCountTokens(req, res, config, signal) {
   }
 }
 
-async function handleMessages(req, res, config, codexSessions, route, requestTracer) {
+async function handleMessages(
+  req,
+  res,
+  config,
+  codexSessions,
+  route,
+  requestTracer,
+  toolReasoningCache
+) {
   const signal = withAbortSignal(req, res, config.requestTimeoutMs);
   req.abortSignal = signal;
   req.gatewayTracer = requestTracer;
@@ -1085,12 +1259,13 @@ async function handleMessages(req, res, config, codexSessions, route, requestTra
 
       await handleCodexJson(req, res, config, codexSessions, route, requestTracer);
       return route;
+    case 'deepseek':
     case 'openai':
       if (req.body?.stream === true) {
-        await streamOpenAiAsAnthropic(req, res, config, route, signal);
+        await streamOpenAiAsAnthropic(req, res, config, route, signal, toolReasoningCache);
         return route;
       }
-      await handleOpenAiJson(req, res, config, route, signal);
+      await handleOpenAiJson(req, res, config, route, signal, toolReasoningCache);
       return route;
     default:
       throw new GatewayError(500, 'api_error', `Unsupported gateway provider: ${route.provider}`);
@@ -1100,11 +1275,12 @@ async function handleMessages(req, res, config, codexSessions, route, requestTra
 export function createGatewayApp(config = loadGatewayConfig(), codexSessions = null, tracer = null) {
   assertGatewayBindIsSafe(config);
   const app = express();
+  const toolReasoningCache = new Map();
 
   app.get('/healthz', function healthz(req, res) {
     res.json({
       ok: true,
-      service: 'ultrathink-anthropic-gateway',
+      service: 'claude-workflow-gateway',
       codex_target_model: config.codex?.model || null,
       codex_sandbox: config.codex?.sandbox || null,
       codex_approval_policy: config.codex?.approvalPolicy || null,
@@ -1113,6 +1289,9 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
       codex_enabled: Boolean(config.codex?.enabled),
       openai_model: config.openai?.model || null,
       openai_reasoning_effort: config.openai?.reasoningEffort || null,
+      deepseek_model: config.deepseek?.model || null,
+      deepseek_reasoning_effort: config.deepseek?.reasoningEffort || null,
+      deepseek_thinking: config.deepseek?.thinking?.type || null,
       anthropic_passthrough_enabled: true,
       anthropic_passthrough_models: config.anthropicPassthroughModels || [],
       exposed_models: config.exposedModels || [],
@@ -1176,7 +1355,15 @@ export function createGatewayApp(config = loadGatewayConfig(), codexSessions = n
         response_model: responseModelForRoute(config, route),
       });
 
-      await handleMessages(req, res, config, codexSessions, route, requestTracer);
+      await handleMessages(
+        req,
+        res,
+        config,
+        codexSessions,
+        route,
+        requestTracer,
+        toolReasoningCache
+      );
       requestTracer?.log?.('gateway.request.completed', {
         ...summarizeGatewayTraceContext(req, route),
         status_code: res.statusCode,

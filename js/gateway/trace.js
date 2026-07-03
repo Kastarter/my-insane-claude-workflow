@@ -69,7 +69,7 @@ export function createGatewayTracer(config = {}) {
         if (!warned) {
           warned = true;
           process.stderr.write(
-            `ultrathink-gateway: trace write failed; suppressing further trace errors: ${error?.message || error}\n`
+            `claude-workflow-gateway: trace write failed; suppressing further trace errors: ${error?.message || error}\n`
           );
         }
       });
