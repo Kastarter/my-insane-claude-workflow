@@ -307,7 +307,38 @@ function forwardedAnthropicCredential(req, config) {
   return null;
 }
 
-function createAnthropicHeaders(config, req) {
+const REFUSAL_FALLBACK_BETA = 'server-side-fallback-2026-06-01';
+
+// Only Fable/Mythos-family requests carry the safety classifier that can return
+// stop_reason: "refusal". Returns the configured fallback model to opt into
+// server-side refusal fallback, or '' when it should not apply.
+function refusalFallbackTarget(config, route) {
+  const target = config.anthropic?.refusalFallbackModel || '';
+  if (!target) {
+    return '';
+  }
+  const upstream = String(route.upstreamModel || '');
+  if (!upstream.startsWith('claude-fable') && !upstream.startsWith('claude-mythos')) {
+    return '';
+  }
+  if (upstream === target) {
+    return '';
+  }
+  return target;
+}
+
+function mergeAnthropicBeta(existing, addition) {
+  const parts = String(existing || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.includes(addition)) {
+    parts.push(addition);
+  }
+  return parts.join(',');
+}
+
+function createAnthropicHeaders(config, req, extraBeta = '') {
   const headers = upstreamHeaders({
     'anthropic-version': req.get('anthropic-version') || config.anthropic.version,
   });
@@ -325,7 +356,10 @@ function createAnthropicHeaders(config, req) {
     );
   }
 
-  const anthropicBeta = req.get('anthropic-beta');
+  let anthropicBeta = req.get('anthropic-beta') || '';
+  if (extraBeta) {
+    anthropicBeta = mergeAnthropicBeta(anthropicBeta, extraBeta);
+  }
   if (anthropicBeta) {
     headers['anthropic-beta'] = anthropicBeta;
   }
@@ -333,14 +367,34 @@ function createAnthropicHeaders(config, req) {
   return headers;
 }
 
+function buildAnthropicBody(req, route, fallbackTarget, extra = {}) {
+  const body = { ...req.body, model: route.upstreamModel, ...extra };
+  if (fallbackTarget) {
+    body.fallbacks = [{ model: fallbackTarget }];
+  }
+  return body;
+}
+
 async function proxyAnthropicJson(req, res, config, route, signal) {
   const url = gatewayUrl(config.anthropic.baseUrl, 'v1/messages');
-  const upstream = await postJson(
+  const fallbackTarget = refusalFallbackTarget(config, route);
+  let upstream = await postJson(
     url,
-    createAnthropicHeaders(config, req),
-    { ...req.body, model: route.upstreamModel },
+    createAnthropicHeaders(config, req, fallbackTarget ? REFUSAL_FALLBACK_BETA : ''),
+    buildAnthropicBody(req, route, fallbackTarget),
     signal
   );
+
+  // If the fallback beta/param is rejected (e.g. unsupported auth mode), retry
+  // once without it so the refusal-fallback opt-in can never break requests.
+  if (fallbackTarget && upstream.status === 400) {
+    upstream = await postJson(
+      url,
+      createAnthropicHeaders(config, req),
+      buildAnthropicBody(req, route, ''),
+      signal
+    );
+  }
 
   const body = await safeJson(upstream);
   res.status(upstream.status).json(body);
@@ -348,12 +402,22 @@ async function proxyAnthropicJson(req, res, config, route, signal) {
 
 async function proxyAnthropicStream(req, res, config, route, signal) {
   const url = gatewayUrl(config.anthropic.baseUrl, 'v1/messages');
-  const upstream = await postJson(
+  const fallbackTarget = refusalFallbackTarget(config, route);
+  let upstream = await postJson(
     url,
-    createAnthropicHeaders(config, req),
-    { ...req.body, model: route.upstreamModel, stream: true },
+    createAnthropicHeaders(config, req, fallbackTarget ? REFUSAL_FALLBACK_BETA : ''),
+    buildAnthropicBody(req, route, fallbackTarget, { stream: true }),
     signal
   );
+
+  if (fallbackTarget && upstream.status === 400) {
+    upstream = await postJson(
+      url,
+      createAnthropicHeaders(config, req),
+      buildAnthropicBody(req, route, '', { stream: true }),
+      signal
+    );
+  }
 
   res.status(upstream.status);
   res.setHeader(

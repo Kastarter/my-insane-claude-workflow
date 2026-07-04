@@ -7038,3 +7038,100 @@ await runTest('gateway proxies Opus 4.8 requests and token counts to Anthropic',
     await closeServer(anthropicServer);
   }
 });
+
+await runTest('gateway opts Fable passthrough into server-side refusal fallback', async function testRefusalFallback() {
+  const anthropicPort = await freePort();
+  const seen = [];
+
+  const anthropicServer = http.createServer(async function handleAnthropic(req, res) {
+    if (req.method === 'POST' && req.url === '/v1/messages') {
+      const body = await readJsonBody(req);
+      seen.push({
+        model: body.model,
+        fallbacks: body.fallbacks || null,
+        beta: req.headers['anthropic-beta'] || '',
+      });
+      const content = String(body.messages?.[0]?.content ?? '');
+      // Simulate Anthropic rejecting the fallbacks param on a marked request,
+      // so the gateway must retry clean.
+      if (body.fallbacks && content.includes('REJECT_FALLBACK')) {
+        res.writeHead(400, jsonHeaders());
+        res.end(JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', message: 'no' } }));
+        return;
+      }
+      res.writeHead(200, jsonHeaders());
+      res.end(JSON.stringify({
+        id: 'msg_fb',
+        type: 'message',
+        role: 'assistant',
+        model: body.model,
+        content: [{ type: 'text', text: 'ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 5, output_tokens: 2 },
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    anthropicServer.once('error', reject);
+    anthropicServer.listen(anthropicPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(gatewayConfig({
+    port: gatewayPort,
+    anthropicPassthroughModels: ['claude-fable-5*', 'claude-opus-4-8*'],
+    exposedModels: ['claude-fable-5', 'claude-opus-4-8'],
+    anthropic: {
+      apiKey: 'anthropic-key',
+      baseUrl: `http://127.0.0.1:${anthropicPort}`,
+      version: '2023-06-01',
+      refusalFallbackModel: 'claude-opus-4-8',
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    // Fable request: fallbacks injected + beta header present.
+    const fableRes = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ model: 'claude-fable-5', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(fableRes.status, 200);
+    const fableSeen = seen[seen.length - 1];
+    assert.deepEqual(fableSeen.fallbacks, [{ model: 'claude-opus-4-8' }]);
+    assert.ok(fableSeen.beta.includes('server-side-fallback-2026-06-01'), 'fable beta header set');
+
+    // Opus request: no fallback injected (target equals model), no fallback beta.
+    const opusRes = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ model: 'claude-opus-4-8', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(opusRes.status, 200);
+    const opusSeen = seen[seen.length - 1];
+    assert.equal(opusSeen.fallbacks, null);
+    assert.ok(!opusSeen.beta.includes('server-side-fallback-2026-06-01'), 'opus has no fallback beta');
+
+    // 400 on the fallbacks attempt triggers a clean retry that succeeds.
+    const before = seen.length;
+    const retryRes = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ model: 'claude-fable-5', messages: [{ role: 'user', content: 'REJECT_FALLBACK please' }] }),
+    });
+    assert.equal(retryRes.status, 200);
+    const attempts = seen.slice(before);
+    assert.equal(attempts.length, 2, 'first attempt + one clean retry');
+    assert.deepEqual(attempts[0].fallbacks, [{ model: 'claude-opus-4-8' }]);
+    assert.equal(attempts[1].fallbacks, null, 'retry drops fallbacks');
+  } finally {
+    await runtime.close();
+    await closeServer(anthropicServer);
+  }
+});

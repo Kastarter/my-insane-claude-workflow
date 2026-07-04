@@ -249,6 +249,13 @@ export function loadGatewayConfig() {
         'https://api.anthropic.com'
       ),
       version: firstEnvString(['ULTRATHINK_GATEWAY_ANTHROPIC_VERSION'], '2023-06-01'),
+      // When set, Fable-family passthrough requests opt into Anthropic's
+      // server-side refusal fallback so a safety-classifier decline is
+      // transparently re-served by this model instead of failing the turn.
+      refusalFallbackModel: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_REFUSAL_FALLBACK,
+        ''
+      ),
     },
   };
 }

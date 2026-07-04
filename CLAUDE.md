@@ -18,7 +18,8 @@ Personal build of `claude-workflow`, derived from the MIT-licensed `ultrathink` 
 
 ## Config
 - Env precedence: parent env → project `.env` → `~/.claude-workflow.env` → `~/.ultrathink.env` (compat).
-- This machine's live config is in `~/.ultrathink.env`: `ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5`, subagent + codex reasoning effort `xhigh`.
+- This machine's live config is in `~/.ultrathink.env`: `ULTRATHINK_GATEWAY_MAIN_MODEL_ID=claude-fable-5`, subagent + codex reasoning effort `xhigh`, `ULTRATHINK_GATEWAY_REFUSAL_FALLBACK=claude-opus-4-8`.
+- `ULTRATHINK_GATEWAY_REFUSAL_FALLBACK`: when set, Fable/Mythos passthrough requests opt into Anthropic server-side refusal fallback (beta `server-side-fallback-2026-06-01`) so a safety-classifier decline is re-served by that model in the same call. Gateway retries once without it on a 400, so it can't break requests. Implemented in `js/gateway/server.js` (`refusalFallbackTarget`/`buildAnthropicBody`); config field `anthropic.refusalFallbackModel`.
 - `[1m]` suffix on a model id is a client-visible alias only; Anthropic passthrough sends the plain id upstream.
 
 ## Current State
