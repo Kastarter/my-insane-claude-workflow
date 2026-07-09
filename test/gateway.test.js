@@ -11,6 +11,7 @@ import path from 'node:path';
 import { translateAnthropicMessagesRequestWithOptions } from '../js/gateway/anthropic-format.js';
 import { loadGatewayConfig } from '../js/gateway/config.js';
 import { buildCodexDynamicToolRegistry, CodexSessionManager } from '../js/gateway/codex-provider.js';
+import { buildWorkflowGatewayConfig } from '../js/gateway/workflow-config.js';
 import { GatewayError, resolveModelRoute } from '../js/gateway/model-routing.js';
 import {
   noProxyMatchesUrl,
@@ -221,16 +222,31 @@ const CLEAN_PROXY_ENV = Object.freeze({
   no_proxy: '',
 });
 const CLEAN_WORKFLOW_ENV = Object.freeze({
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '',
   CLAUDE_WORKFLOW_MAIN_PROVIDER: '',
   CLAUDE_WORKFLOW_SUBAGENT_MODEL_ID: '',
   DEEPSEEK_API_KEY: '',
   DEEPSEEK_BASE_URL: '',
   DEEPSEEK_DEFAULT_MODEL_ID: '',
+  GLM_API_KEY: '',
+  GLM_BASE_URL: '',
+  GLM_DEFAULT_MODEL_ID: '',
+  ZAI_API_KEY: '',
+  ZAI_BASE_URL: '',
+  ZAI_DEFAULT_MODEL_ID: '',
+  ZAI_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_ANTHROPIC_PASSTHROUGH_MODELS: '',
+  ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '',
+  ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: '',
+  ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_API_KEY: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_BASE_URL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_MODEL: '',
   ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: '',
+  ULTRATHINK_GATEWAY_GLM_API_KEY: '',
+  ULTRATHINK_GATEWAY_GLM_BASE_URL: '',
+  ULTRATHINK_GATEWAY_GLM_MODEL: '',
+  ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: '',
   ULTRATHINK_GATEWAY_MAIN_MODEL_ID: '',
   ULTRATHINK_GATEWAY_MAIN_PROVIDER: '',
   ULTRATHINK_GATEWAY_MAIN_REASONING_EFFORT: '',
@@ -240,6 +256,7 @@ const CLEAN_WORKFLOW_ENV = Object.freeze({
   ULTRATHINK_GATEWAY_SUBAGENT_UPSTREAM_MODEL: '',
   ULTRATHINK_GATEWAY_SUBAGENT_VERBOSITY: '',
   ULTRATHINK_DEEPSEEK_REASONING_EFFORT: '',
+  ULTRATHINK_GLM_REASONING_EFFORT: '',
   ULTRATHINK_THINKING_LEVEL: '',
 });
 
@@ -286,6 +303,10 @@ function gatewayConfig(overrides = {}) {
       approvalPolicy: 'never',
       reasoningEffort: 'medium',
       verbosity: 'high',
+      toolResultMaxBytes: 10_000,
+      toolResultWindowMaxBytes: 64_000,
+      autoCompactTokenLimit: 0,
+      autoCompactTokenLimitScope: 'body_after_prefix',
       idleTimeoutMs: 60_000,
       forkIdleTimeoutMs: 30_000,
       maxSessions: 16,
@@ -303,6 +324,16 @@ function gatewayConfig(overrides = {}) {
       model: 'deepseek-v4-pro',
       reasoningEffort: 'max',
       thinking: { type: 'enabled' },
+    },
+    glm: {
+      apiKey: '',
+      baseUrl: 'http://127.0.0.1:1',
+      model: 'glm-5.2',
+      reasoningEffort: 'max',
+      thinking: {
+        type: 'enabled',
+        clear_thinking: false,
+      },
     },
     anthropic: {
       apiKey: '',
@@ -325,6 +356,10 @@ function gatewayConfig(overrides = {}) {
     deepseek: {
       ...baseConfig.deepseek,
       ...overrides.deepseek,
+    },
+    glm: {
+      ...baseConfig.glm,
+      ...overrides.glm,
     },
     anthropic: {
       ...baseConfig.anthropic,
@@ -376,14 +411,45 @@ function deepSeekFableGatewayConfig(gatewayPort, deepSeekPort, overrides = {}) {
   });
 }
 
-function deepSeekReasoningHeaders(sessionId) {
+function glmGatewayConfig(gatewayPort, glmPort, overrides = {}) {
+  const configOverrides = overrides.config || {};
+  const glmOverrides = overrides.glm || {};
+  const routeOverrides = overrides.route || {};
+
+  return gatewayConfig({
+    ...configOverrides,
+    port: gatewayPort,
+    exposedModels: ['glm-5.2[1m]'],
+    routeMap: {
+      'glm-5.2[1m]': {
+        provider: 'glm',
+        model: 'glm-5.2[1m]',
+        reasoningEffort: 'max',
+        ...routeOverrides,
+      },
+    },
+    glm: {
+      apiKey: 'glm-key',
+      baseUrl: `http://127.0.0.1:${glmPort}`,
+      model: 'glm-5.2',
+      reasoningEffort: 'max',
+      thinking: {
+        type: 'enabled',
+        clear_thinking: false,
+      },
+      ...glmOverrides,
+    },
+  });
+}
+
+function reasoningReplayHeaders(sessionId) {
   return jsonHeaders({
     'x-claude-code-session-id': sessionId,
     'x-claude-code-agent-id': 'agent-weather',
   });
 }
 
-function assertDeepSeekReasoningReplay(capturedBodies) {
+function assertToolCallReasoningReplay(capturedBodies) {
   const assistantMessage = capturedBodies[1].messages.find(function findAssistant(message) {
     return message.role === 'assistant';
   });
@@ -842,6 +908,65 @@ await runTest('gateway defaults DeepSeek routes to enabled max reasoning', async
   );
 });
 
+await runTest('gateway config reads an independent GLM route profile', async function testGlmGatewayProfile() {
+  await withTemporaryEnv(
+    {
+      ULTRATHINK_GATEWAY_GLM_API_KEY: 'gateway-glm-key',
+      ZAI_API_KEY: 'ambient-zai-key',
+      GLM_API_KEY: 'ambient-glm-key',
+      ULTRATHINK_GATEWAY_GLM_BASE_URL: 'http://127.0.0.1:9877',
+      ZAI_BASE_URL: 'http://should-not-win',
+      GLM_BASE_URL: 'http://also-should-not-win',
+      ULTRATHINK_GATEWAY_GLM_MODEL: 'glm-5.2',
+      GLM_DEFAULT_MODEL_ID: 'glm-other',
+      ZAI_DEFAULT_MODEL_ID: 'zai-other',
+      ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: 'high',
+      ULTRATHINK_GLM_REASONING_EFFORT: 'max',
+      ZAI_REASONING_EFFORT: 'low',
+      ULTRATHINK_THINKING_LEVEL: 'OFF',
+    },
+    async function assertGlmGatewayProfile() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.glm.apiKey, 'gateway-glm-key');
+      assert.equal(config.glm.baseUrl, 'http://127.0.0.1:9877');
+      assert.equal(config.glm.model, 'glm-5.2');
+      assert.equal(config.glm.reasoningEffort, 'high');
+      assert.deepEqual(config.glm.thinking, { type: 'disabled' });
+      ok('GLM gateway routing has its own credentials, endpoint, model, and thinking profile');
+    }
+  );
+});
+
+await runTest('gateway defaults GLM routes to max preserved thinking', async function testGlmGatewayDefaults() {
+  await withTemporaryEnv(
+    {
+      GLM_BASE_URL: '',
+      GLM_DEFAULT_MODEL_ID: '',
+      ZAI_BASE_URL: '',
+      ZAI_DEFAULT_MODEL_ID: '',
+      ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: '',
+      ULTRATHINK_GATEWAY_GLM_BASE_URL: '',
+      ULTRATHINK_GATEWAY_GLM_MODEL: '',
+      ULTRATHINK_GLM_REASONING_EFFORT: '',
+      ZAI_REASONING_EFFORT: '',
+      ULTRATHINK_THINKING_LEVEL: '',
+    },
+    async function assertGlmGatewayDefaults() {
+      const config = loadGatewayConfig();
+
+      assert.equal(config.glm.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+      assert.equal(config.glm.model, 'glm-5.2');
+      assert.equal(config.glm.reasoningEffort, 'max');
+      assert.deepEqual(config.glm.thinking, {
+        type: 'enabled',
+        clear_thinking: false,
+      });
+      ok('GLM gateway routes default to Z.ai coding endpoint with max preserved thinking');
+    }
+  );
+});
+
 await runTest('gateway defaults Codex-backed routes to writable never-approval sessions', async function testCodexSessionDefaults() {
   const previous = {
     ULTRATHINK_GATEWAY_CODEX_ENABLED: process.env.ULTRATHINK_GATEWAY_CODEX_ENABLED,
@@ -946,6 +1071,41 @@ await runTest('gateway wildcard route-map entries override passthrough patterns'
   ok('wildcard route-map entries are applied before the Anthropic passthrough fallback');
 });
 
+await runTest('gateway strips client-only [1m] qualifiers before GLM upstream calls', async function testGlmOneMillionAlias() {
+  const route = resolveModelRoute(
+    'glm-5.2[1m]',
+    gatewayConfig({
+      routeMap: {
+        'glm-5.2[1m]': {
+          provider: 'glm',
+          model: 'glm-5.2[1m]',
+          reasoningEffort: 'max',
+        },
+      },
+      glm: {
+        apiKey: 'glm-key',
+        baseUrl: 'http://127.0.0.1:1',
+        model: 'glm-5.2',
+        reasoningEffort: 'high',
+        thinking: {
+          type: 'enabled',
+          clear_thinking: false,
+        },
+      },
+    })
+  );
+
+  assert.equal(route.provider, 'glm');
+  assert.equal(route.requestedModel, 'glm-5.2[1m]');
+  assert.equal(route.upstreamModel, 'glm-5.2');
+  assert.equal(route.reasoningEffort, 'max');
+  assert.deepEqual(route.thinking, {
+    type: 'enabled',
+    clear_thinking: false,
+  });
+  ok('GLM routes expose the Claude Code 1m alias while sending the bare Z.ai model id');
+});
+
 await runTest('gateway config exposes the Codex close kill timeout knob', async function testCodexCloseKillTimeoutConfig() {
   await withTemporaryEnv(
     { ULTRATHINK_GATEWAY_CODEX_CLOSE_KILL_TIMEOUT_MS: '250' },
@@ -967,6 +1127,69 @@ await runTest('gateway config exposes the Codex input budget', async function te
     }
   );
 });
+
+await runTest('gateway config exposes the Codex tool-result byte budget', async function testCodexToolResultBudgetConfig() {
+  await withTemporaryEnv(
+    { ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES: '2048' },
+    async function assertToolResultBudgetConfig() {
+      const config = loadGatewayConfig();
+      assert.equal(config.codex.toolResultMaxBytes, 2048);
+      ok('Codex app-server tool-result byte budget is configurable through the gateway config');
+    }
+  );
+});
+
+await runTest(
+  'gateway config exposes Codex context-compaction guardrails',
+  async function testCodexCompactionGuardrailConfig() {
+    await withTemporaryEnv(
+      {
+        ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES: '8192',
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT: '123456',
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: 'total',
+      },
+      async function assertCompactionGuardrailConfig() {
+        const config = loadGatewayConfig();
+        assert.equal(config.codex.toolResultWindowMaxBytes, 8192);
+        assert.equal(config.codex.autoCompactTokenLimit, 123456);
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'total');
+        ok('Codex aggregate tool-result and auto-compaction guardrails are configurable');
+      }
+    );
+  }
+);
+
+await runTest(
+  'gateway config defaults Codex auto-compaction to body-after-prefix scope',
+  async function testCodexAutoCompactScopeDefault() {
+    await withTemporaryEnv(
+      {
+        ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE: undefined,
+      },
+      async function assertAutoCompactScopeDefault() {
+        const config = loadGatewayConfig();
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
+        ok('Codex gateway threads avoid total-context autocompact thrash by default');
+      }
+    );
+  }
+);
+
+await runTest(
+  'claude-workflow defaults Codex auto-compaction below its recycle budget',
+  async function testWorkflowCodexAutoCompactDefault() {
+    await withTemporaryEnv(
+      CLEAN_WORKFLOW_ENV,
+      async function assertWorkflowCodexAutoCompactDefault() {
+        const { config } = buildWorkflowGatewayConfig();
+        assert.equal(config.codex.inputMaxTokens, 180_000);
+        assert.equal(config.codex.autoCompactTokenLimit, 126_000);
+        assert.equal(config.codex.autoCompactTokenLimitScope, 'body_after_prefix');
+        ok('workflow Codex sessions compact before they reach the gateway recycle threshold');
+      }
+    );
+  }
+);
 
 await runTest('gateway config exposes the Codex session pool cap', async function testCodexMaxSessionsConfig() {
   await withTemporaryEnv(
@@ -1420,6 +1643,39 @@ await runTest('Codex dynamic tool registry aliases reserved Claude tool names', 
   );
   assert.equal(registry.byInternalName.get('ext_tool_002')?.originalName, 'Workflow');
   ok('reserved Claude tool names are remapped before reaching Codex app-server');
+});
+
+await runTest('Codex dynamic Read tool metadata teaches safe offsets', async function testCodexReadToolGuidance() {
+  const readSchema = {
+    type: 'object',
+    properties: {
+      file_path: { type: 'string' },
+      offset: { type: 'integer', description: 'Old offset docs.' },
+      limit: { type: 'integer', description: 'Old limit docs.' },
+      pages: { type: 'string' },
+    },
+    required: ['file_path'],
+    additionalProperties: false,
+  };
+  const registry = buildCodexDynamicToolRegistry([
+    {
+      name: 'Read',
+      description: 'Reads a file.',
+      input_schema: readSchema,
+    },
+  ]);
+  const tool = registry.dynamicTools[0];
+
+  assert.equal(tool.name, 'ext_tool_001');
+  assert.equal(registry.byInternalName.get('ext_tool_001')?.originalName, 'Read');
+  assert.match(tool.description, /Codex Read guidance/u);
+  assert.match(tool.description, /zero-based continuation index/u);
+  assert.match(tool.inputSchema.properties.offset.description, /Old offset docs/u);
+  assert.match(tool.inputSchema.properties.offset.description, /Displayed line numbers/u);
+  assert.match(tool.inputSchema.properties.limit.description, /Old limit docs/u);
+  assert.match(tool.inputSchema.properties.limit.description, /continuing a large file/u);
+  assert.equal(readSchema.properties.offset.description, 'Old offset docs.');
+  ok('Read tools receive Codex-specific offset guidance without mutating Claude tool schemas');
 });
 
 await runTest('Codex session manager reuses the pending session when a matching tool_result arrives', async function testToolResultSessionReuse() {
@@ -2187,8 +2443,16 @@ await runTest(
       assert.equal(threadStarts.length, 2);
       assert.equal(threadStarts[0].params.threadSource, 'user');
       assert.equal(threadStarts[0].params.ephemeral, undefined);
+      assert.equal(
+        threadStarts[0].params.config.model_auto_compact_token_limit_scope,
+        'body_after_prefix'
+      );
       assert.equal(threadStarts[1].params.threadSource, 'subagent');
       assert.equal(threadStarts[1].params.ephemeral, true);
+      assert.equal(
+        threadStarts[1].params.config.model_auto_compact_token_limit_scope,
+        'body_after_prefix'
+      );
       ok('Claude workflow agent Codex threads are pathless/non-resumable app-server threads');
     } finally {
       await fs.rm(tempDir, { recursive: true, force: true });
@@ -2361,6 +2625,676 @@ await runTest(
 );
 
 await runTest(
+  'Codex app-server sanitizes unsafe Read arguments and returns offset feedback',
+  async function testCodexReadArgumentsAndFeedback() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-feedback-'));
+    const codexPath = path.join(tempDir, 'codex-read-feedback');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-read-feedback";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_read', method: 'item/tool/call', params: { turnId, callId: 'call_read', tool: 'ext_tool_001', arguments: { file_path: '/tmp/example.txt', offset: 1300000, limit: '20', pages: '' } } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_read') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        const { entries, tracer } = captureTracer();
+        manager = new CodexSessionManager(
+          {
+            requestTimeoutMs: 5_000,
+            codex: {
+              command: codexPath,
+              cwd: tempDir,
+              idleTimeoutMs: 0,
+              inputMaxTokens: 10_000,
+              toolResultMaxBytes: 10_000,
+            },
+          },
+          { tracer }
+        );
+        const tools = [
+          {
+            name: 'Read',
+            description: 'Reads a file.',
+            input_schema: {
+              type: 'object',
+              properties: {
+                file_path: { type: 'string' },
+                offset: { type: 'integer' },
+                limit: { type: 'integer' },
+                pages: { type: 'string' },
+              },
+              required: ['file_path'],
+              additionalProperties: false,
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Read the file carefully.' }],
+          tools,
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_read',
+          name: 'Read',
+          input: {
+            file_path: '/tmp/example.txt',
+            limit: 20,
+          },
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Read the file carefully.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_read',
+                    name: 'Read',
+                    input: toolUse.toolCall.input,
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_read',
+                    content: 'File has 331 lines, but offset 1300000 was requested.',
+                    is_error: true,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = responses.find(function findReadResponse(message) {
+          return message.id === 'tool_req_read';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+        const sanitizeTrace = entries.find(function findSanitizeTrace(entry) {
+          return entry.event === 'codex.read_tool.arguments_sanitized';
+        });
+        const inputTrace = entries.find(function findInputTrace(entry) {
+          return entry.event === 'codex.turn.input_prepared';
+        });
+        const resultTrace = entries.find(function findResultTrace(entry) {
+          return entry.event === 'codex.tool_result.continued';
+        });
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(continuedCall.result.success, false);
+        assert.match(continuedText, /Proxy Read offset note:/u);
+        assert.match(continuedText, /exceeds the gateway rewrite threshold/u);
+        assert.match(continuedText, /Codex Read guidance:/u);
+        assert.match(continuedText, /zero-based continuation index/u);
+        assert.deepEqual(sanitizeTrace.details.sanitization.reasons, [
+          'empty_pages_removed',
+          'offset_exceeds_rewrite_threshold',
+          'limit_normalized',
+        ]);
+        assert.equal(sanitizeTrace.details.sanitization.sanitized_limit, 20);
+        assert.equal(sanitizeTrace.details.sanitization.empty_pages_removed, true);
+        assert.equal(inputTrace.details.summary.message_count, 1);
+        assert.equal(inputTrace.details.summary.text_bytes > 0, true);
+        assert.equal(resultTrace.details.read_result_feedback.rewriteNoteAppended, true);
+        assert.equal(resultTrace.details.read_result_feedback.guidanceAppended, true);
+        assert.equal(resultTrace.details.read_sanitization.offset_removed, true);
+        ok('unsafe Read offset requests are rewritten before Claude runs the tool and explained afterward');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server truncates large Read results with continuation metadata',
+  async function testCodexReadResultTruncation() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-read-truncate-'));
+    const codexPath = path.join(tempDir, 'codex-read-truncate');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-read-truncate";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_read_truncate', method: 'item/tool/call', params: { turnId, callId: 'call_read_truncate', tool: 'ext_tool_001', arguments: { file_path: '/tmp/big.txt' } } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_read_truncate') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        const { entries, tracer } = captureTracer();
+        manager = new CodexSessionManager(
+          {
+            requestTimeoutMs: 5_000,
+            codex: {
+              command: codexPath,
+              cwd: tempDir,
+              idleTimeoutMs: 0,
+              inputMaxTokens: 10_000,
+              toolResultMaxBytes: 900,
+            },
+          },
+          { tracer }
+        );
+        const tools = [
+          {
+            name: 'Read',
+            input_schema: {
+              type: 'object',
+              properties: {
+                file_path: { type: 'string' },
+                offset: { type: 'integer' },
+                limit: { type: 'integer' },
+              },
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Read a large file.' }],
+          tools,
+        };
+        const rawResult = Array.from({ length: 120 }, function line(_, index) {
+          return `line-${String(index + 1).padStart(3, '0')} ${'x'.repeat(24)}`;
+        }).join('\n');
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_read_truncate',
+          name: 'Read',
+          input: {
+            file_path: '/tmp/big.txt',
+          },
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Read a large file.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_read_truncate',
+                    name: 'Read',
+                    input: toolUse.toolCall.input,
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_read_truncate',
+                    content: rawResult,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = responses.find(function findReadResponse(message) {
+          return message.id === 'tool_req_read_truncate';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+        const resultTrace = entries.find(function findResultTrace(entry) {
+          return entry.event === 'codex.tool_result.continued';
+        });
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.match(continuedText, /^Warning: truncated Read output/u);
+        assert.match(continuedText, /Total output lines: 120/u);
+        assert.match(continuedText, /Read output omitted to fit Codex context budget/u);
+        assert.match(continuedText, /For continuation reads/u);
+        assert.equal(continuedText.includes('line-001'), true);
+        assert.equal(continuedText.includes('line-060'), false);
+        assert.equal(continuedText.includes('line-120'), true);
+        assert.equal(resultTrace.details.read_tool_result, true);
+        assert.equal(resultTrace.details.tool_result_truncated, true);
+        assert.equal(resultTrace.details.raw_result_bytes > resultTrace.details.result_bytes, true);
+        ok('large Read results preserve boundaries and continuation instructions when shortened');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server tool_result payloads are truncated before continuing dynamic tools',
+  async function testCodexToolResultsAreTruncatedBeforeContinue() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-budget-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-budget');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-large-result";\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_large', method: 'item/tool/call', params: { turnId, callId: 'call_large', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_large') {\n" +
+          '    record(message);\n' +
+          '    if (message.result) {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+            toolResultMaxBytes: 40,
+          },
+        });
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Call the lookup tool.' }],
+          tools: [
+            {
+              name: 'lookup',
+              input_schema: {
+                type: 'object',
+                properties: {},
+              },
+            },
+          ],
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_large',
+          name: 'lookup',
+          input: {},
+        });
+
+        const rawResult = `${'A'.repeat(80)}MIDDLE_SHOULD_BE_REMOVED${'B'.repeat(80)}`;
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Call the lookup tool.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_large',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_large',
+                    content: rawResult,
+                  },
+                ],
+              },
+            ],
+            tools: initialRequest.tools,
+          },
+          codexRoute()
+        );
+        const finalResponses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedCall = finalResponses.find(function findLargeResponse(message) {
+          return message.id === 'tool_req_large';
+        });
+        const continuedText = continuedCall.result.contentItems[0].text;
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(continuedCall.result.success, true);
+        assert.match(continuedText, /^Warning: truncated output/u);
+        assert.match(continuedText, /chars truncated/u);
+        assert.equal(continuedText.includes('MIDDLE_SHOULD_BE_REMOVED'), false);
+        assert.equal(continuedText.includes('AAAAAAAAAAAAAAAAAAAA'), true);
+        assert.equal(continuedText.includes('BBBBBBBBBBBBBBBBBBBB'), true);
+        assert.equal(continuedText.length < rawResult.length, true);
+        ok('large Claude tool_result payloads are bounded before they enter Codex app-server history');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server dynamic tool_result payloads share a session byte budget',
+  async function testCodexToolResultsShareSessionBudget() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-window-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-window');
+    const responsesPath = path.join(tempDir, 'tool-responses.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const fs = require('node:fs');\n" +
+          "const readline = require('node:readline');\n" +
+          'const responsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'const responses = [];\n' +
+          'const turnId = "turn-tool-window";\n' +
+          'let nextCall = 1;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function record(message) {\n' +
+          '  responses.push(message);\n' +
+          "  fs.writeFileSync(responsesPath, JSON.stringify(responses), 'utf8');\n" +
+          '}\n' +
+          'function sendToolCall() {\n' +
+          '  const index = nextCall;\n' +
+          '  nextCall += 1;\n' +
+          "  send({ id: `tool_req_${index}`, method: 'item/tool/call', params: { turnId, callId: `call_${index}`, tool: 'ext_tool_001', arguments: { index } } });\n" +
+          '}\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-1' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(sendToolCall, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id && message.id.startsWith('tool_req_')) {\n" +
+          '    record(message);\n' +
+          '    if (responses.length < 3) {\n' +
+          '      setTimeout(sendToolCall, 5);\n' +
+          '    } else {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const previousPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = responsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+            toolResultMaxBytes: 100,
+            toolResultWindowMaxBytes: 70,
+          },
+        });
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: [{ role: 'user', content: 'Call the lookup tool repeatedly.' }],
+          tools,
+        };
+        function toolResultRequest(callId, text) {
+          return {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Call the lookup tool repeatedly.' },
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: callId,
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: callId,
+                    content: text,
+                  },
+                ],
+              },
+            ],
+            tools,
+          };
+        }
+
+        const firstToolUse = await manager.processRequest(
+          gatewayRequest(),
+          initialRequest,
+          codexRoute()
+        );
+        assert.equal(firstToolUse.toolCall.id, 'call_1');
+
+        const secondToolUse = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_1', 'A'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(secondToolUse.toolCall.id, 'call_2');
+
+        const thirdToolUse = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_2', 'B'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(thirdToolUse.toolCall.id, 'call_3');
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          toolResultRequest('call_3', 'C'.repeat(40)),
+          codexRoute()
+        );
+        assert.equal(finalOutcome.type, 'final');
+
+        const responses = JSON.parse(await fs.readFile(responsesPath, 'utf8'));
+        const continuedTexts = responses.map(function responseText(message) {
+          return message.result.contentItems[0].text;
+        });
+
+        assert.equal(continuedTexts[0], 'A'.repeat(40));
+        assert.match(continuedTexts[1], /^Warning: truncated output/u);
+        assert.match(continuedTexts[1], /chars truncated/u);
+        assert.match(continuedTexts[2], /^Warning: truncated output/u);
+        assert.match(continuedTexts[2], /40 chars truncated/u);
+        assert.equal(continuedTexts[2].includes('CCCC'), false);
+        ok('aggregate dynamic-tool output is bounded across a Codex session');
+      } finally {
+        await manager?.close();
+        if (previousPath === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
   'Codex app-server usage reports per-boundary input cache and reasoning deltas',
   async function testCodexUsageDeltas() {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-delta-'));
@@ -2440,6 +3374,79 @@ await runTest(
           total_tokens: 47,
         });
         ok('Codex cumulative usage is translated into per-response Claude usage deltas');
+      } finally {
+        await manager.close();
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex app-server usage prefers last snapshot when total is also present',
+  async function testCodexUsagePrefersLastSnapshot() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-usage-last-total-'));
+    const codexPath = path.join(tempDir, 'codex-usage-last-total');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "const readline = require('node:readline');\n" +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: 'thread-usage-last-total' } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          "    const turnId = 'turn-1';\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function completeTurn() {\n' +
+          "      send({ method: 'item/agentMessage/delta', params: { turnId, itemId: 'message-1', delta: 'done' } });\n" +
+          '      const tokenUsage = {\n' +
+          '        total: { inputTokens: 1000, cachedInputTokens: 500, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1250 },\n' +
+          '        last: { inputTokens: 120, cachedInputTokens: 40, outputTokens: 9, reasoningOutputTokens: 3, totalTokens: 132 },\n' +
+          '      };\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n' +
+          'setInterval(function keepAlive() {}, 1000);\n'
+      );
+
+      const manager = new CodexSessionManager({
+        requestTimeoutMs: 5_000,
+        codex: {
+          command: codexPath,
+          cwd: tempDir,
+          idleTimeoutMs: 0,
+        },
+      });
+
+      try {
+        const outcome = await manager.processRequest(
+          claudeSessionRequest('codex-usage-last-total'),
+          codexUserRequest('Mixed total and last usage turn.'),
+          codexRoute()
+        );
+
+        assert.deepEqual(outcome.usage, {
+          input_tokens: 80,
+          output_tokens: 12,
+          cache_read_input_tokens: 40,
+          reasoning_output_tokens: 3,
+          total_tokens: 132,
+        });
+        ok('Codex last usage snapshots drive per-response Anthropic usage when available');
       } finally {
         await manager.close();
       }
@@ -3211,6 +4218,451 @@ await runTest('Codex sessions recycle before the reported context can overflow t
   }
 });
 
+await runTest(
+  'Codex sessions recycle against configured budget when the model window is larger',
+  async function testCodexSessionRecycleUsesConfiguredBudget() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-budget-recycle-'));
+    const codexPath = path.join(tempDir, 'codex-budget-recycle');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendTurn(entry) {\n' +
+          '  const logPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          '  let turns = [];\n' +
+          '  try { turns = JSON.parse(fs.readFileSync(logPath, "utf8")); } catch {}\n' +
+          '  turns.push(entry);\n' +
+          '  fs.writeFileSync(logPath, JSON.stringify(turns), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          "    const turnId = `turn-${message.id}`;\n" +
+          '    appendTurn({ pid: process.pid, input: message.params.input[0].text });\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    setTimeout(function reportUsage() {\n' +
+          '      const tokenUsage = {\n' +
+          '        last: { inputTokens: 140, outputTokens: 10, totalTokens: 150 },\n' +
+          '        modelContextWindow: 1000000,\n' +
+          '      };\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage } });\n" +
+          "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '    }, 10);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTarget = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      try {
+        const manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 180,
+          },
+        });
+        const req = claudeSessionRequest('budget-recycle');
+
+        await manager.processRequest(
+          req,
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [{ role: 'user', content: 'hi' }],
+            tools: [],
+          },
+          codexRoute()
+        );
+        await manager.processRequest(
+          req,
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'hi' },
+              { role: 'assistant', content: [{ type: 'text', text: 'ok' }] },
+              { role: 'user', content: 'again' },
+            ],
+            tools: [],
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes('again'), true);
+        assert.equal(turns[1].input.includes('hi'), true);
+        await manager.close();
+        ok('Codex session pressure honors the configured input budget before the learned window');
+      } finally {
+        if (previousTarget === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTarget;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex matching tool_result requests recycle when replay pressure exceeds stale usage estimates',
+  async function testCodexToolResultReplayPressureRecycle() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-replay');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+    const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
+    const replayMarker = 'RESULT_MARKER_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ';
+
+    try {
+      await fs.writeFile(toolResponsesPath, '[]', 'utf8');
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'const turnLogPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          'const toolResponsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendJson(pathname, entry) {\n' +
+          '  let items = [];\n' +
+          '  try { items = JSON.parse(fs.readFileSync(pathname, "utf8")); } catch {}\n' +
+          '  items.push(entry);\n' +
+          '  fs.writeFileSync(pathname, JSON.stringify(items), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          '    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const input = message.params.input[0].text;\n' +
+          '    appendJson(turnLogPath, { pid: process.pid, input });\n' +
+          "    const turnId = `turn-${process.pid}`;\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          `    if (input.includes(${JSON.stringify(replayMarker)})) {\n` +
+          '      setTimeout(function completeReplayTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '      return;\n' +
+          '    }\n' +
+          '    setTimeout(function emitUsageAndToolCall() {\n' +
+          "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 1 }, modelContextWindow: 120 } } });\n" +
+          "      send({ id: 'tool_req_replay', method: 'item/tool/call', params: { turnId, callId: 'call_replay', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_replay') {\n" +
+          '    appendJson(toolResponsesPath, { pid: process.pid, message });\n' +
+          '    setTimeout(function completeContinuedTurn() {\n' +
+          "      send({ method: 'turn/completed', params: { turn: { id: `turn-${process.pid}`, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnLog = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      const previousToolResponses = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = toolResponsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 100,
+          },
+        });
+
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const openingMessages = [
+          { role: 'user', content: 'Background context. '.repeat(8) },
+          { role: 'assistant', content: [{ type: 'text', text: 'Prior analysis. '.repeat(4) }] },
+          { role: 'user', content: 'Call the lookup tool and wait for the result.' },
+        ];
+        const initialRequest = {
+          model: CODEX_REQUEST_MODEL,
+          messages: openingMessages,
+          tools,
+        };
+
+        const toolUse = await manager.processRequest(gatewayRequest(), initialRequest, codexRoute());
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_replay',
+          name: 'lookup',
+          input: {},
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              ...openingMessages,
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_replay',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_replay',
+                    content: replayMarker,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes(replayMarker), true);
+        assert.deepEqual(toolResponses, []);
+        ok(
+          'matching tool_result requests recycle to a fresh transcript replay when replay pressure exceeds stale usage'
+        );
+      } finally {
+        await manager?.close();
+        if (previousTurnLog === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTurnLog;
+        }
+        if (previousToolResponses === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousToolResponses;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
+await runTest(
+  'Codex matching tool_result requests recycle when replay pressure exceeds missing usage estimates',
+  async function testCodexToolResultReplayPressureRecycleWithoutUsage() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-tool-result-replay-nou-'));
+    const codexPath = path.join(tempDir, 'codex-tool-result-replay-no-usage');
+    const turnLogPath = path.join(tempDir, 'turn-log.json');
+    const toolResponsesPath = path.join(tempDir, 'tool-responses.json');
+    const replayMarker = 'RESULT_MARKER_WITHOUT_USAGE_QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ';
+
+    try {
+      await fs.writeFile(toolResponsesPath, '[]', 'utf8');
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'const turnLogPath = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;\n' +
+          'const toolResponsesPath = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          'function appendJson(pathname, entry) {\n' +
+          '  let items = [];\n' +
+          '  try { items = JSON.parse(fs.readFileSync(pathname, "utf8")); } catch {}\n' +
+          '  items.push(entry);\n' +
+          '  fs.writeFileSync(pathname, JSON.stringify(items), "utf8");\n' +
+          '}\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          '    send({ id: message.id, result: { thread: { id: `thread-${process.pid}` } } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const input = message.params.input[0].text;\n' +
+          '    appendJson(turnLogPath, { pid: process.pid, input });\n' +
+          "    const turnId = `turn-${process.pid}`;\n" +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          `    if (input.includes(${JSON.stringify(replayMarker)})) {\n` +
+          '      setTimeout(function completeReplayTurn() {\n' +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 5);\n' +
+          '      return;\n' +
+          '    }\n' +
+          '    setTimeout(function emitToolCall() {\n' +
+          "      send({ id: 'tool_req_replay_no_usage', method: 'item/tool/call', params: { turnId, callId: 'call_replay_no_usage', tool: 'ext_tool_001', arguments: {} } });\n" +
+          '    }, 5);\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.id === 'tool_req_replay_no_usage') {\n" +
+          '    appendJson(toolResponsesPath, { pid: process.pid, message });\n' +
+          '    setTimeout(function completeContinuedTurn() {\n' +
+          "      send({ method: 'turn/completed', params: { turn: { id: `turn-${process.pid}`, status: 'completed' } } });\n" +
+          '    }, 5);\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnLog = process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+      const previousToolResponses = process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = turnLogPath;
+      process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = toolResponsesPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 100,
+          },
+        });
+
+        const tools = [
+          {
+            name: 'lookup',
+            input_schema: {
+              type: 'object',
+              properties: {},
+            },
+          },
+        ];
+        const openingMessages = [
+          { role: 'user', content: 'Background context. '.repeat(8) },
+          { role: 'assistant', content: [{ type: 'text', text: 'Prior analysis. '.repeat(4) }] },
+          { role: 'user', content: 'Call the lookup tool and wait for the result.' },
+        ];
+
+        const toolUse = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: openingMessages,
+            tools,
+          },
+          codexRoute()
+        );
+        assert.equal(toolUse.type, 'tool_use');
+        assert.deepEqual(toolUse.toolCall, {
+          id: 'call_replay_no_usage',
+          name: 'lookup',
+          input: {},
+        });
+
+        const finalOutcome = await manager.processRequest(
+          gatewayRequest(),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              ...openingMessages,
+              {
+                role: 'assistant',
+                content: [
+                  {
+                    type: 'tool_use',
+                    id: 'call_replay_no_usage',
+                    name: 'lookup',
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'tool_result',
+                    tool_use_id: 'call_replay_no_usage',
+                    content: replayMarker,
+                  },
+                ],
+              },
+            ],
+            tools,
+          },
+          codexRoute()
+        );
+
+        const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
+        const toolResponses = JSON.parse(await fs.readFile(toolResponsesPath, 'utf8'));
+
+        assert.equal(finalOutcome.type, 'final');
+        assert.equal(turns.length, 2);
+        assert.notEqual(turns[0].pid, turns[1].pid);
+        assert.equal(turns[1].input.includes(replayMarker), true);
+        assert.deepEqual(toolResponses, []);
+        ok(
+          'matching tool_result requests recycle to a fresh transcript replay even before the app-server reports usage'
+        );
+      } finally {
+        await manager?.close();
+        if (previousTurnLog === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_LOG;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_LOG = previousTurnLog;
+        }
+        if (previousToolResponses === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TOOL_RESPONSES = previousToolResponses;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
 await runTest('Codex learned context windows bound budgets for later sessions', async function testCodexLearnedWindowBudgets() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-learned-window-'));
   const codexPath = path.join(tempDir, 'codex-learned-window');
@@ -3248,7 +4700,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
         '    appendTurn({ input: message.params.input[0].text });\n' +
         '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
         '    setTimeout(function reportUsage() {\n' +
-        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 }, modelContextWindow: 40 } } });\n" +
+        "      send({ method: 'thread/tokenUsage/updated', params: { turnId, tokenUsage: { last: { inputTokens: 5, outputTokens: 2 }, modelContextWindow: 80 } } });\n" +
         "      send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
         '    }, 10);\n' +
         '  }\n' +
@@ -3268,7 +4720,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
         },
       });
 
-      // First session teaches the manager the model's 40-token window.
+      // First session teaches the manager the model's 80-token window.
       await manager.processRequest(
         claudeSessionRequest('learned-window-a'),
         {
@@ -3280,8 +4732,8 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
       );
 
       // A brand-new session must render its bootstrap transcript inside the
-      // learned window (40 tokens * 0.8 = 32 tokens = 96 chars), truncating
-      // the long history while keeping the newest message.
+      // learned window and below the recycle threshold:
+      // floor(floor(80 * 0.8) * 0.75 * 0.9) = 43 tokens = 129 chars.
       await manager.processRequest(
         claudeSessionRequest('learned-window-b'),
         {
@@ -3298,7 +4750,7 @@ await runTest('Codex learned context windows bound budgets for later sessions', 
 
       const turns = JSON.parse(await fs.readFile(turnLogPath, 'utf8'));
       assert.equal(turns.length, 2);
-      assert.equal(turns[1].input.length <= 32 * 3, true);
+      assert.equal(turns[1].input.length <= 43 * 3, true);
       assert.equal(turns[1].input.includes('KEEP'), true);
       assert.equal(turns[1].input.includes('Ancient history'), false);
       await manager.close();
@@ -3529,6 +4981,192 @@ await runTest('Codex context-ish 502s that miss recovery matching are traced', a
   ok('context-like Codex 502 wording drift is traceable even when recovery does not engage');
 });
 
+await runTest(
+  'Codex Read diagnostics cannot mask context-like provider failures',
+  async function testCodexReadDiagnosticsDoNotThrow() {
+    const { entries, tracer } = captureTracer();
+    const manager = new CodexSessionManager(
+      {
+        codex: {
+          idleTimeoutMs: 0,
+          forkIdleTimeoutMs: 0,
+          maxSessions: 16,
+        },
+      },
+      {
+        tracer,
+        createSession(route, req, requestBody, sessionKey) {
+          return stubCodexSession(sessionKey, {
+            pendingToolCall: {
+              callId: 'call_read_bad_result',
+              tool: 'Read',
+              readSanitization: null,
+            },
+            async advance() {
+              throw new GatewayError(
+                502,
+                'api_error',
+                'provider input token budget exceeded before generation'
+              );
+            },
+          });
+        },
+      }
+    );
+
+    await assert.rejects(
+      manager.processRequest(
+        claudeSessionRequest('session-context-read-diagnostics'),
+        {
+          model: CODEX_REQUEST_MODEL,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_read_bad_result',
+                  content: [
+                    {
+                      type: 'image',
+                      source: {
+                        type: 'base64',
+                        media_type: 'image/png',
+                        data: 'x',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+          tools: [],
+        },
+        codexRoute()
+      ),
+      /token budget exceeded/u
+    );
+
+    const driftTrace = entries.find(function findDriftTrace(entry) {
+      return entry.event === 'codex.session.context_recovery_unmatched';
+    });
+    assert.equal(Boolean(driftTrace), true);
+    assert.match(
+      driftTrace.details.read_context.read_tool_result_parse_error,
+      /unsupported tool_result content block type/u
+    );
+    ok('Read diagnostic tracing records malformed results without replacing the provider failure');
+  }
+);
+
+await runTest(
+  'Codex autocompact-thrash final text recovers as context overflow',
+  async function testCodexAutocompactThrashTextRecovery() {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-thrash-retry-'));
+    const codexPath = path.join(tempDir, 'codex-thrash-retry');
+    const turnParamsPath = path.join(tempDir, 'turn-params.jsonl');
+    const failureMarkerPath = path.join(tempDir, 'failed-once');
+
+    try {
+      await makeExecutable(
+        codexPath,
+        '#!/usr/bin/env node\n' +
+          "import fs from 'node:fs';\n" +
+          "import readline from 'node:readline';\n" +
+          'const rl = readline.createInterface({ input: process.stdin });\n' +
+          'function send(message) { process.stdout.write(`${JSON.stringify(message)}\\n`); }\n' +
+          "rl.on('line', function onLine(line) {\n" +
+          '  const message = JSON.parse(line);\n' +
+          "  if (message.method === 'initialize') {\n" +
+          '    send({ id: message.id, result: { protocolVersion: 2 } });\n' +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'thread/start') {\n" +
+          "    send({ id: message.id, result: { thread: { id: `thread-${message.id}` } } });\n" +
+          '    return;\n' +
+          '  }\n' +
+          "  if (message.method === 'turn/start') {\n" +
+          '    const turnId = `turn-${message.id}`;\n' +
+          '    fs.appendFileSync(process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS, `${JSON.stringify(message.params)}\\n`, "utf8");\n' +
+          '    send({ id: message.id, result: { turn: { id: turnId } } });\n' +
+          '    if (!fs.existsSync(process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER)) {\n' +
+          '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER, "1", "utf8");\n' +
+          '      setTimeout(function emitThrashOutcome() {\n' +
+          "        send({ method: 'item/completed', params: { turnId, item: { id: 'agent-thrash', type: 'agentMessage', text: 'Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous compact, 3 times in a row. A file being read or a tool output is likely too large for the context window.' } } });\n" +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 10);\n' +
+          '    } else {\n' +
+          '      setTimeout(function completeTurn() {\n' +
+          "        send({ method: 'item/completed', params: { turnId, item: { id: 'agent-ok', type: 'agentMessage', text: 'recovered after compact thrash' } } });\n" +
+          "        send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });\n" +
+          '      }, 10);\n' +
+          '    }\n' +
+          '  }\n' +
+          '});\n'
+      );
+
+      const previousTurnParams = process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+      const previousFailMarker = process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER;
+      process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = turnParamsPath;
+      process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER = failureMarkerPath;
+      let manager = null;
+      try {
+        manager = new CodexSessionManager({
+          requestTimeoutMs: 5_000,
+          codex: {
+            command: codexPath,
+            cwd: tempDir,
+            idleTimeoutMs: 0,
+            inputMaxTokens: 10_000,
+          },
+        });
+
+        const outcome = await manager.processRequest(
+          claudeSessionRequest('session-thrash-retry'),
+          {
+            model: CODEX_REQUEST_MODEL,
+            messages: [
+              { role: 'user', content: 'Old context that should be omitted after thrash.' },
+              { role: 'assistant', content: 'Old answer that should be omitted after thrash.' },
+              { role: 'user', content: 'Current request after autocompact thrash.' },
+            ],
+            tools: [],
+          },
+          codexRoute()
+        );
+
+        assert.equal(outcome.type, 'final');
+        assert.equal(outcome.text, 'recovered after compact thrash');
+
+        const turnParams = (await fs.readFile(turnParamsPath, 'utf8'))
+          .trim()
+          .split(/\n/u)
+          .map(function parseLine(line) {
+            return JSON.parse(line);
+          });
+        assert.equal(turnParams.length, 2);
+        assert.equal(turnParams[1].input[0].text.includes('Current request after autocompact thrash.'), true);
+        assert.equal(turnParams[1].input[0].text.includes('Old context'), false);
+        ok('autocompact-thrash assistant outcomes recover through the context-overflow path');
+      } finally {
+        await manager?.close();
+        if (previousTurnParams === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_TURN_PARAMS = previousTurnParams;
+        }
+        if (previousFailMarker === undefined) {
+          delete process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER;
+        } else {
+          process.env.ULTRATHINK_TEST_CODEX_FAIL_MARKER = previousFailMarker;
+        }
+      }
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
+  }
+);
+
 await runTest('Codex first-turn transcript overflow recovers straight to latest-only input', async function testCodexContextWindowRecovery() {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ultrathink-codex-context-retry-'));
   const codexPath = path.join(tempDir, 'codex-context-retry');
@@ -3561,7 +5199,10 @@ await runTest('Codex first-turn transcript overflow recovers straight to latest-
         '    try { failCount = Number(fs.readFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, "utf8")); } catch {}\n' +
         '    if (failCount < 1) {\n' +
         '      fs.writeFileSync(process.env.ULTRATHINK_TEST_CODEX_FAILURE_MARKER, String(failCount + 1), "utf8");\n' +
-        "      setTimeout(function failTurn() { send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'failed', error: { message: \"Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.\" } } } }); }, 10);\n" +
+        '      const error = { message: "prompt is too long: 1017300 tokens > 1000000 maximum" };\n' +
+        '      setTimeout(function failTurn() {\n' +
+        '        send({ method: "turn/completed", params: { turn: { id: turnId, status: "failed", error } } });\n' +
+        '      }, 10);\n' +
         '      return;\n' +
         '    }\n' +
         "    setTimeout(function completeTurn() {\n" +
@@ -4662,6 +6303,7 @@ await runTest(
           '    health,\n' +
           '    models,\n' +
           "    subagentModel: process.env.CLAUDE_CODE_SUBAGENT_MODEL || '',\n" +
+          "    autoCompactWindow: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '',\n" +
           '  };\n' +
           "  fs.writeFileSync(process.env.ULTRATHINK_TEST_CLAUDE_HEALTH_PATH, JSON.stringify(payload), 'utf8');\n" +
           "  process.stdout.write('CLI_OK\\n');\n" +
@@ -4706,6 +6348,13 @@ await runTest(
         ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT: 'max',
         ULTRATHINK_GATEWAY_EXPOSED_MODELS: 'claude-fable-5-20260601',
       });
+      const glmMainHealth = await runWithDisplayEnv('glm-main-health.json', {
+        ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'glm-5.2[1m]',
+        ULTRATHINK_GATEWAY_MAIN_PROVIDER: 'glm',
+        ULTRATHINK_GATEWAY_GLM_API_KEY: 'glm-key',
+        ULTRATHINK_GATEWAY_GLM_MODEL: 'glm-5.2',
+        ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT: 'max',
+      });
       const collisionHealth = await runWithDisplayEnv('main-subagent-collision-health.json', {
         ULTRATHINK_GATEWAY_MAIN_MODEL_ID: 'claude-sonnet-4-7',
         ULTRATHINK_GATEWAY_SUBAGENT_MODEL_ID: 'claude-sonnet-4-7',
@@ -4720,6 +6369,7 @@ await runTest(
 
       assert.equal(defaultHealth.health.display_routed_model, true);
       assert.equal(defaultHealth.subagentModel, WORKFLOW_DISPLAY_SUBAGENT_MODEL);
+      assert.equal(defaultHealth.autoCompactWindow, '');
       // The launcher now defaults the frontier main model to Fable 5 1m and keeps
       // the Fable 5 family on Anthropic; lower-tier Claude ids route to Codex gpt-5.5.
       assert.deepEqual(
@@ -4757,6 +6407,7 @@ await runTest(
       );
       assert.equal(deepSeekMainHealth.health.deepseek_model, 'deepseek-v4-pro');
       assert.equal(deepSeekMainHealth.health.deepseek_reasoning_effort, 'max');
+      assert.equal(deepSeekMainHealth.autoCompactWindow, '');
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-fable-5[1m]'),
         'DeepSeek Main Route'
@@ -4768,6 +6419,18 @@ await runTest(
       assert.equal(
         modelDisplayName(deepSeekMainHealth, 'claude-fable-5-20260601'),
         'DeepSeek Main Route'
+      );
+      assert.equal(glmMainHealth.health.glm_model, 'glm-5.2');
+      assert.equal(glmMainHealth.health.glm_reasoning_effort, 'max');
+      assert.equal(glmMainHealth.health.glm_thinking, 'enabled');
+      assert.equal(glmMainHealth.autoCompactWindow, '1000000');
+      assert.equal(
+        modelDisplayName(glmMainHealth, 'glm-5.2[1m]'),
+        'GLM Main Route'
+      );
+      assert.equal(
+        modelDisplayName(glmMainHealth, 'glm-5.2'),
+        'GLM Main Route'
       );
       assert.equal(
         modelDisplayName(collisionHealth, 'claude-sonnet-4-7'),
@@ -6116,6 +7779,198 @@ await runTest('gateway omits DeepSeek reasoning effort when thinking is disabled
   }
 });
 
+await runTest('gateway routes configured models to GLM-compatible chat completions', async function testGlmGatewayRouting() {
+  const glmPort = await freePort();
+  let capturedBody = null;
+  let capturedUrl = null;
+  let capturedAuthorization = '';
+
+  const glmServer = http.createServer(async function handleGlm(req, res) {
+    capturedUrl = req.url;
+    capturedAuthorization = req.headers.authorization || '';
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-glm-route',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'GLM route ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 21,
+          prompt_tokens_details: {
+            cached_tokens: 7,
+          },
+          completion_tokens: 5,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    glmServer.once('error', reject);
+    glmServer.listen(glmPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort, {
+    config: {
+      displayRoutedModel: true,
+      openai: {
+        apiKey: 'openai-key-should-not-be-used',
+        baseUrl: 'http://127.0.0.1:1',
+      },
+    },
+    route: {
+      reasoningEffort: 'max',
+      displayName: 'GLM 5.2 Route',
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'glm-5.2[1m]',
+        system: 'You are terse.',
+        max_tokens: 128,
+        messages: [
+          {
+            role: 'user',
+            content: 'Use GLM.',
+          },
+        ],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'tool',
+          name: 'lookup_weather',
+          disable_parallel_tool_use: true,
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+
+    assert.equal(capturedUrl, '/chat/completions');
+    assert.equal(capturedAuthorization, 'Bearer glm-key');
+    assert.equal(capturedBody.model, 'glm-5.2');
+    assert.equal(capturedBody.reasoning_effort, 'max');
+    assert.equal(capturedBody.max_tokens, 128);
+    assert.equal(capturedBody.max_completion_tokens, undefined);
+    assert.deepEqual(capturedBody.thinking, {
+      type: 'enabled',
+      clear_thinking: false,
+    });
+    assert.equal(capturedBody.tools[0].function.name, 'lookup_weather');
+    assert.deepEqual(capturedBody.tool_choice, {
+      type: 'function',
+      function: {
+        name: 'lookup_weather',
+      },
+    });
+    assert.equal(capturedBody.parallel_tool_calls, false);
+    assert.deepEqual(
+      capturedBody.messages.map(function roles(message) {
+        return message.role;
+      }),
+      ['system', 'user']
+    );
+    assert.equal(
+      payload.model,
+      routedResponseModel({
+        provider: 'glm',
+        upstreamModel: 'glm-5.2',
+        reasoningEffort: 'max',
+        requestedModel: 'glm-5.2[1m]',
+      })
+    );
+    assert.equal(payload.usage.input_tokens, 21);
+    assert.equal(payload.usage.output_tokens, 5);
+    assert.equal(payload.usage.cache_read_input_tokens, 7);
+    assert.equal(payload.content[0].text, 'GLM route ok.');
+    ok('GLM routes use their own credentials, endpoint, request shape, and response metadata');
+  } finally {
+    await runtime.close();
+    await closeServer(glmServer);
+  }
+});
+
+await runTest('gateway omits GLM reasoning effort when thinking is disabled', async function testGlmDisabledThinkingRouting() {
+  const glmPort = await freePort();
+  let capturedBody = null;
+
+  const glmServer = http.createServer(async function handleGlm(req, res) {
+    capturedBody = await readJsonBody(req);
+    res.writeHead(200, jsonHeaders());
+    res.end(
+      JSON.stringify({
+        id: 'chatcmpl-glm-disabled-thinking',
+        choices: [
+          {
+            finish_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'GLM no thinking ok.',
+            },
+          },
+        ],
+        usage: {
+          prompt_tokens: 12,
+          completion_tokens: 4,
+        },
+      })
+    );
+  });
+
+  await new Promise(function listen(resolve, reject) {
+    glmServer.once('error', reject);
+    glmServer.listen(glmPort, '127.0.0.1', resolve);
+  });
+
+  const gatewayPort = await freePort();
+  const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort, {
+    glm: {
+      thinking: { type: 'disabled' },
+    },
+  }));
+
+  await waitForListening(runtime.server);
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({
+        model: 'glm-5.2[1m]',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'Use GLM without thinking.' }],
+        tools: [lookupWeatherTool()],
+        tool_choice: {
+          type: 'auto',
+        },
+      }),
+    });
+    assert.equal(response.status, 200);
+
+    assert.equal(capturedBody.reasoning_effort, undefined);
+    assert.deepEqual(capturedBody.thinking, { type: 'disabled' });
+    assert.equal(capturedBody.tool_choice, 'auto');
+    ok('GLM disabled-thinking requests omit reasoning_effort while keeping normal tool_choice translation');
+  } finally {
+    await runtime.close();
+    await closeServer(glmServer);
+  }
+});
+
 await runTest(
   'gateway translates replayed assistant thinking blocks for DeepSeek routes',
   async function testDeepSeekAssistantThinkingReplay() {
@@ -6289,7 +8144,7 @@ await runTest(
 
     await waitForListening(runtime.server);
 
-    const headers = deepSeekReasoningHeaders('session-deepseek-json-reasoning');
+    const headers = reasoningReplayHeaders('session-deepseek-json-reasoning');
 
     try {
       const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
@@ -6336,11 +8191,140 @@ await runTest(
       });
       assert.equal(secondResponse.status, 200);
 
-      assertDeepSeekReasoningReplay(capturedBodies);
+      assertToolCallReasoningReplay(capturedBodies);
       ok('DeepSeek JSON tool loops replay reasoning_content on the assistant tool-call message');
     } finally {
       await runtime.close();
       await closeServer(deepSeekServer);
+    }
+  }
+);
+
+await runTest(
+  'gateway preserves GLM reasoning content across JSON tool-result turns',
+  async function testGlmReasoningToolLoopJson() {
+    const glmPort = await freePort();
+    const capturedBodies = [];
+
+    const glmServer = http.createServer(async function handleGlm(req, res) {
+      capturedBodies.push(await readJsonBody(req));
+      res.writeHead(200, jsonHeaders());
+
+      if (capturedBodies.length === 1) {
+        res.end(
+          JSON.stringify({
+            id: 'chatcmpl-glm-tool',
+            choices: [
+              {
+                finish_reason: 'tool_calls',
+                message: {
+                  role: 'assistant',
+                  content: null,
+                  reasoning_content: 'Need weather.',
+                  tool_calls: [
+                    {
+                      id: 'call_weather',
+                      type: 'function',
+                      function: {
+                        name: 'lookup_weather',
+                        arguments: JSON.stringify({ city: 'SF' }),
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+            usage: {
+              prompt_tokens: 20,
+              completion_tokens: 6,
+            },
+          })
+        );
+        return;
+      }
+
+      res.end(
+        JSON.stringify({
+          id: 'chatcmpl-glm-final',
+          choices: [
+            {
+              finish_reason: 'stop',
+              message: {
+                role: 'assistant',
+                content: 'Weather checked.',
+              },
+            },
+          ],
+          usage: {
+            prompt_tokens: 35,
+            completion_tokens: 4,
+          },
+        })
+      );
+    });
+
+    await new Promise(function listen(resolve, reject) {
+      glmServer.once('error', reject);
+      glmServer.listen(glmPort, '127.0.0.1', resolve);
+    });
+
+    const gatewayPort = await freePort();
+    const runtime = createGatewayServer(glmGatewayConfig(gatewayPort, glmPort));
+
+    await waitForListening(runtime.server);
+
+    const headers = reasoningReplayHeaders('session-glm-json-reasoning');
+
+    try {
+      const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'glm-5.2[1m]',
+          max_tokens: 256,
+          messages: [{ role: 'user', content: 'Check weather.' }],
+          tools: [lookupWeatherTool()],
+        }),
+      });
+      assert.equal(firstResponse.status, 200);
+      const firstPayload = await firstResponse.json();
+      const toolUse = firstPayload.content.find(function findToolUse(block) {
+        return block.type === 'tool_use';
+      });
+      assert.equal(toolUse.id, 'call_weather');
+
+      const secondResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          model: 'glm-5.2[1m]',
+          max_tokens: 256,
+          messages: [
+            { role: 'user', content: 'Check weather.' },
+            {
+              role: 'assistant',
+              content: [toolUse],
+            },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_weather',
+                  content: '72F',
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      assert.equal(secondResponse.status, 200);
+
+      assertToolCallReasoningReplay(capturedBodies);
+      ok('GLM JSON tool loops replay reasoning_content on the assistant tool-call message');
+    } finally {
+      await runtime.close();
+      await closeServer(glmServer);
     }
   }
 );
@@ -6435,10 +8419,10 @@ await runTest('gateway streams OpenAI chunks as Anthropic SSE events', async fun
     assert.match(text, /"type":"text_delta","text":"Hel"/u);
     assert.match(text, /"type":"text_delta","text":"lo"/u);
     assert.match(text, /"stop_reason":"end_turn"/u);
-    assert.equal(terminalDelta.payload.usage.input_tokens, 0);
+    assert.equal(terminalDelta.payload.usage.input_tokens, 10);
     assert.equal(terminalDelta.payload.usage.output_tokens, 5);
     assert.match(text, /event: message_stop/u);
-    ok('streaming path emits Anthropic-style SSE events with output-only usage');
+    ok('streaming path emits Anthropic-style SSE events with upstream input and output usage');
   } finally {
     await runtime.close();
     await closeServer(openAiServer);
@@ -6722,7 +8706,7 @@ await runTest(
 
     await waitForListening(runtime.server);
 
-    const headers = deepSeekReasoningHeaders('session-deepseek-stream-reasoning');
+    const headers = reasoningReplayHeaders('session-deepseek-stream-reasoning');
 
     try {
       const firstResponse = await fetch(`http://127.0.0.1:${gatewayPort}/v1/messages`, {
@@ -6779,7 +8763,7 @@ await runTest(
       });
       assert.equal(secondResponse.status, 200);
 
-      assertDeepSeekReasoningReplay(capturedBodies);
+      assertToolCallReasoningReplay(capturedBodies);
       ok('DeepSeek streaming tool loops replay reasoning_content on the assistant tool-call message');
     } finally {
       await runtime.close();

@@ -6,6 +6,9 @@ import { GatewayError } from './model-routing.js';
 
 const DEFAULT_CLOSE_KILL_TIMEOUT_MS = 2_000;
 const DEFAULT_FORK_IDLE_TIMEOUT_MS = 30_000;
+const DEFAULT_TOOL_RESULT_MAX_BYTES = 10_000;
+const DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES = 64_000;
+const DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 // Cold-start bound only: once the Codex app-server reports the model's real
 // context window (thread/tokenUsage/updated), budgets adapt to it. Codex
 // gpt-5.5 reports a 258,400-token window with ~10k tokens of baseline
@@ -32,22 +35,49 @@ const CODEX_APP_SERVER_FATAL_STDERR_PATTERNS = [
 ];
 const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
 // Recycle a live Codex session before its real context (as reported by the
-// app-server) can overflow the model window: long tool loops accumulate
-// history turn by turn, so per-payload budgets alone cannot bound the sum.
-// The threshold is a fraction of the model window itself; bootstrap replays
-// are capped strictly below it (see bootstrapInputMaxTokens) so a freshly
-// recycled session can never immediately re-trigger recycling.
+// app-server) can overflow the gateway's effective input budget. Long tool
+// loops accumulate history turn by turn, so per-payload budgets alone cannot
+// bound the sum. Bootstrap replays are capped strictly below this threshold
+// (see bootstrapInputMaxTokens) so a freshly recycled session can never
+// immediately re-trigger recycling.
 const CODEX_SESSION_RECYCLE_FRACTION = 0.75;
 const CODEX_BOOTSTRAP_RECYCLE_HEADROOM = 0.9;
+const CODEX_CONTEXT_DROP_RESET_FRACTION = 0.8;
 // Code-heavy content tokenizes near 3 chars/token, not the prose-like 4.
 // Undershooting chars-per-token overflows the upstream window (fatal);
 // overshooting only truncates earlier, so estimate conservatively everywhere
 // budgets and recycle projections are computed.
 const ESTIMATE_CHARS_PER_TOKEN = 3;
+const CODEX_AUTOCOMPACT_THRASH_PATTERN =
+  /autocompact is thrashing|context refilled to the limit|within 3 turns of the previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_ERROR_PATTERN =
-  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history/iu;
+  /context window|context length|maximum context|too many tokens|ran out of room|clear earlier history|prompt is too long|tokens?\s*>\s*\d+\s+maximum|autocompact is thrashing|context refilled to the limit|previous compact|tool output is likely too large/iu;
 const CODEX_CONTEXT_WINDOW_DRIFT_PATTERN =
   /token|history|context|window|room|compact|truncate|too large|too long|exceed/iu;
+const READ_TOOL_NAME = 'Read';
+const READ_OFFSET_REWRITE_THRESHOLD = 1_000_000;
+const READ_GUIDANCE_HEADER = 'Codex Read guidance:';
+const READ_REWRITE_NOTE_HEADER = 'Proxy Read offset note:';
+const READ_OFFSET_EXCEEDS_REASON = 'offset_exceeds_rewrite_threshold';
+const READ_INVALID_OFFSET_REASON = 'invalid_offset_removed';
+const READ_INVALID_LIMIT_REASON = 'invalid_limit_removed';
+const READ_EMPTY_PAGES_REASON = 'empty_pages_removed';
+const READ_OFFSET_SCHEMA_DESCRIPTION =
+  'Optional zero-based continuation index. Use only after a prior Read of the same file returned content and more lines are needed. Compute as prior offset plus returned line count. Displayed line numbers, grep line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets. Omit when unsure.';
+const READ_LIMIT_SCHEMA_DESCRIPTION =
+  'Optional number of lines to read. Omit when opening a file. Use with offset only when continuing a large file.';
+const READ_CONTINUATION_HINT =
+  'For continuation reads, use offset = previous offset + returned line count; displayed line numbers are not valid offsets.';
+const READ_OUTPUT_OMISSION_MARKER =
+  '\n\n[...Read output omitted to fit Codex context budget...]\n\n';
+const READ_OFFSET_GUIDANCE_LINES = [
+  READ_GUIDANCE_HEADER,
+  '- offset is an optional zero-based continuation index, not a line number lookup.',
+  '- Use offset only after a prior Read of the same file returned content and more lines are needed.',
+  '- Compute offset as prior offset plus the number of lines returned by that prior Read.',
+  '- Displayed line numbers, grep line numbers, byte counts, token counts, file sizes, and guessed positions are invalid offsets.',
+  '- Omit offset and limit when opening a file or when unsure.',
+];
 
 function noop() {}
 
@@ -176,11 +206,86 @@ function defaultToolInputSchema() {
   };
 }
 
+function cloneJsonValue(value) {
+  if (!value || typeof value !== 'object') {
+    return value;
+  }
+
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return value;
+  }
+}
+
 function normalizeToolInputSchema(tool) {
   if (tool?.input_schema && typeof tool.input_schema === 'object') {
-    return tool.input_schema;
+    return cloneJsonValue(tool.input_schema);
   }
   return defaultToolInputSchema();
+}
+
+function isReadToolName(name) {
+  return name === READ_TOOL_NAME;
+}
+
+function readOffsetGuidance() {
+  return READ_OFFSET_GUIDANCE_LINES.join('\n');
+}
+
+function codexToolDescription(tool) {
+  const description = tool?.description || tool?.name || '';
+  if (!isReadToolName(tool?.name)) {
+    return description;
+  }
+
+  if (description.includes(READ_GUIDANCE_HEADER)) {
+    return description;
+  }
+
+  const base = description || 'Reads a file from the local filesystem.';
+  return `${base}\n\n${readOffsetGuidance()}`;
+}
+
+function appendSchemaPropertyDescription(schema, propertyName, description) {
+  const properties = schema?.properties;
+  if (!properties || typeof properties !== 'object') {
+    return;
+  }
+
+  const property = properties[propertyName];
+  if (!property || typeof property !== 'object' || Array.isArray(property)) {
+    return;
+  }
+
+  const existing = typeof property.description === 'string' ? property.description.trim() : '';
+  if (!existing) {
+    property.description = description;
+    return;
+  }
+
+  if (existing.includes(description)) {
+    property.description = existing;
+    return;
+  }
+
+  property.description = `${existing}\n\n${description}`;
+}
+
+function codexToolInputSchema(tool) {
+  const schema = normalizeToolInputSchema(tool);
+  if (!isReadToolName(tool?.name)) {
+    return schema;
+  }
+
+  appendSchemaPropertyDescription(
+    schema,
+    'offset',
+    READ_OFFSET_SCHEMA_DESCRIPTION
+  );
+  appendSchemaPropertyDescription(schema, 'limit', READ_LIMIT_SCHEMA_DESCRIPTION);
+
+  return schema;
 }
 
 export function buildCodexDynamicToolRegistry(tools) {
@@ -188,19 +293,21 @@ export function buildCodexDynamicToolRegistry(tools) {
   const byInternalName = new Map();
   const dynamicTools = originalTools.map(function mapTool(tool, index) {
     const internalName = `ext_tool_${String(index + 1).padStart(3, '0')}`;
+    const description = codexToolDescription(tool);
+    const inputSchema = codexToolInputSchema(tool);
     const record = {
       internalName,
       originalName: tool.name,
-      description: tool.description || '',
-      inputSchema: normalizeToolInputSchema(tool),
+      description,
+      inputSchema,
     };
 
     byInternalName.set(internalName, record);
 
     return {
       name: internalName,
-      description: tool.description || tool.name || internalName,
-      inputSchema: record.inputSchema,
+      description: description || tool.name || internalName,
+      inputSchema,
     };
   });
 
@@ -264,6 +371,174 @@ function effectiveToolSchemaSignature(requestBody) {
 
 function originalToolName(registry, internalName) {
   return registry.byInternalName.get(internalName)?.originalName || internalName;
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function integerToolArgument(value) {
+  if (Number.isInteger(value)) {
+    return value;
+  }
+
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  const trimmed = value.trim();
+  if (!/^-?\d+$/u.test(trimmed)) {
+    return null;
+  }
+
+  const parsed = Number(trimmed);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
+function markReadIntegerArgumentRemoved(info, key, reason) {
+  switch (key) {
+    case 'offset':
+      info.offsetRemoved = true;
+      info.offsetRemovedReason = reason;
+      return;
+    case 'limit':
+      info.limitRemoved = true;
+      info.limitRemovedReason = reason;
+      return;
+    default:
+      return;
+  }
+}
+
+function recordSanitizedReadIntegerArgument(info, key, value) {
+  switch (key) {
+    case 'offset':
+      info.sanitizedOffset = value;
+      return;
+    case 'limit':
+      info.sanitizedLimit = value;
+      return;
+    default:
+      return;
+  }
+}
+
+function removeReadIntegerArgument(args, key, info, reason) {
+  delete args[key];
+  info.changed = true;
+  info.reasons.push(reason);
+  markReadIntegerArgumentRemoved(info, key, reason);
+}
+
+function normalizeReadIntegerArgument(args, key, info, options) {
+  if (!Object.hasOwn(args, key)) {
+    return;
+  }
+
+  const original = args[key];
+  const parsed = integerToolArgument(original);
+  if (parsed === null || parsed < options.minimum) {
+    removeReadIntegerArgument(args, key, info, options.invalidReason);
+    return;
+  }
+
+  if (key === 'offset') {
+    info.hadOffset = true;
+    info.originalOffset = original;
+    if (parsed >= READ_OFFSET_REWRITE_THRESHOLD) {
+      removeReadIntegerArgument(args, key, info, READ_OFFSET_EXCEEDS_REASON);
+      return;
+    }
+  }
+
+  if (original !== parsed) {
+    args[key] = parsed;
+    info.changed = true;
+    info.reasons.push(`${key}_normalized`);
+  }
+
+  recordSanitizedReadIntegerArgument(info, key, parsed);
+}
+
+function readFilePathFromArgs(args) {
+  if (typeof args.file_path === 'string') {
+    return args.file_path;
+  }
+
+  if (typeof args.path === 'string') {
+    return args.path;
+  }
+
+  return null;
+}
+
+function sanitizeCodexToolCallArguments(toolName, args, callId = null) {
+  const safeArgs = isPlainObject(args) ? cloneJsonValue(args) : {};
+  if (!isReadToolName(toolName)) {
+    return {
+      arguments: safeArgs,
+      readSanitization: null,
+    };
+  }
+
+  const info = {
+    isReadTool: true,
+    callId,
+    changed: false,
+    reasons: [],
+    hadOffset: Object.hasOwn(safeArgs, 'offset'),
+    originalOffset: safeArgs.offset ?? null,
+    sanitizedOffset: null,
+    sanitizedLimit: null,
+    offsetRemoved: false,
+    offsetRemovedReason: null,
+    limitRemoved: false,
+    limitRemovedReason: null,
+    emptyPagesRemoved: false,
+    filePath: readFilePathFromArgs(safeArgs),
+  };
+
+  if (safeArgs.pages === '') {
+    delete safeArgs.pages;
+    info.changed = true;
+    info.emptyPagesRemoved = true;
+    info.reasons.push(READ_EMPTY_PAGES_REASON);
+  }
+
+  normalizeReadIntegerArgument(safeArgs, 'offset', info, {
+    minimum: 0,
+    invalidReason: READ_INVALID_OFFSET_REASON,
+  });
+  normalizeReadIntegerArgument(safeArgs, 'limit', info, {
+    minimum: 1,
+    invalidReason: READ_INVALID_LIMIT_REASON,
+  });
+
+  return {
+    arguments: safeArgs,
+    readSanitization: info,
+  };
+}
+
+function readSanitizationTrace(readSanitization) {
+  if (!readSanitization) {
+    return null;
+  }
+
+  return {
+    changed: readSanitization.changed,
+    reasons: readSanitization.reasons,
+    had_offset: readSanitization.hadOffset,
+    original_offset: readSanitization.originalOffset,
+    sanitized_offset: readSanitization.sanitizedOffset,
+    sanitized_limit: readSanitization.sanitizedLimit,
+    offset_removed: readSanitization.offsetRemoved,
+    offset_removed_reason: readSanitization.offsetRemovedReason,
+    limit_removed: readSanitization.limitRemoved,
+    limit_removed_reason: readSanitization.limitRemovedReason,
+    empty_pages_removed: readSanitization.emptyPagesRemoved,
+    file_path: readSanitization.filePath,
+  };
 }
 
 function requestFingerprint(requestBody) {
@@ -370,9 +645,16 @@ function estimateIncomingRequestTokens(requestBody) {
   }
 }
 
+function estimateReplayTranscriptTokens(requestBody) {
+  try {
+    return estimateTokensFromText(renderTranscriptInput(requestBody));
+  } catch {
+    return 0;
+  }
+}
+
 function codexRecycleContextLimit(config, contextWindow) {
-  const window = Number(contextWindow || 0);
-  const base = window > 0 ? window : codexInputMaxTokens(config);
+  const base = effectiveCodexInputMaxTokens(config, contextWindow);
   if (!Number.isFinite(base)) {
     return Number.POSITIVE_INFINITY;
   }
@@ -475,6 +757,246 @@ function limitTextByTokenBudget(text, maxTokens) {
   const headChars = Math.ceil(remainingChars / 2);
   const tailChars = Math.floor(remainingChars / 2);
   return `${value.slice(0, headChars)}${marker}${value.slice(-tailChars)}`;
+}
+
+function codexToolResultMaxBytes(config) {
+  const maxBytes = numberOrDefault(
+    config?.codex?.toolResultMaxBytes,
+    DEFAULT_TOOL_RESULT_MAX_BYTES
+  );
+  if (maxBytes <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxBytes));
+}
+
+function codexToolResultWindowMaxBytes(config) {
+  const maxBytes = numberOrDefault(
+    config?.codex?.toolResultWindowMaxBytes,
+    DEFAULT_TOOL_RESULT_WINDOW_MAX_BYTES
+  );
+  if (maxBytes <= 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+
+  return Math.max(1, Math.trunc(maxBytes));
+}
+
+function byteLength(text) {
+  return Buffer.byteLength(String(text || ''), 'utf8');
+}
+
+function approxCodexOutputTokenCount(text) {
+  return Math.max(1, Math.ceil(Buffer.byteLength(String(text || ''), 'utf8') / 4));
+}
+
+function countOutputLines(text) {
+  const value = String(text || '');
+  if (!value) {
+    return 0;
+  }
+
+  const normalized = value.replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
+  const lines = normalized.split('\n');
+  if (lines.at(-1) === '') {
+    lines.pop();
+  }
+
+  return lines.length;
+}
+
+function utf8PrefixByByteBudget(text, maxBytes) {
+  if (maxBytes <= 0) {
+    return '';
+  }
+
+  let bytes = 0;
+  let end = 0;
+  for (const char of text) {
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > maxBytes) {
+      break;
+    }
+
+    bytes += charBytes;
+    end += char.length;
+  }
+
+  return text.slice(0, end);
+}
+
+function utf8SuffixByByteBudget(text, maxBytes) {
+  if (maxBytes <= 0) {
+    return '';
+  }
+
+  let bytes = 0;
+  let start = text.length;
+  for (let index = text.length; index > 0;) {
+    let charStart = index - 1;
+    const code = text.charCodeAt(charStart);
+    if (code >= 0xdc00 && code <= 0xdfff && charStart > 0) {
+      charStart -= 1;
+    }
+
+    const char = text.slice(charStart, index);
+    const charBytes = Buffer.byteLength(char, 'utf8');
+    if (bytes + charBytes > maxBytes) {
+      break;
+    }
+
+    bytes += charBytes;
+    start = charStart;
+    index = charStart;
+  }
+
+  return text.slice(start);
+}
+
+function truncateMiddleByByteBudget(text, maxBytes) {
+  const value = String(text || '');
+  const originalBytes = Buffer.byteLength(value, 'utf8');
+  if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
+    return {
+      text: value,
+      truncated: false,
+      originalBytes,
+      originalTokenCount: approxCodexOutputTokenCount(value),
+      totalLines: countOutputLines(value),
+    };
+  }
+
+  const budget = Math.max(0, Math.trunc(maxBytes));
+  const leftBudget = Math.floor(budget / 2);
+  const rightBudget = budget - leftBudget;
+  const prefix = utf8PrefixByByteBudget(value, leftBudget);
+  const suffix = utf8SuffixByByteBudget(value, rightBudget);
+  const removedChars = Math.max(0, value.length - prefix.length - suffix.length);
+
+  return {
+    text: `${prefix}...${removedChars} chars truncated...${suffix}`,
+    truncated: true,
+    originalBytes,
+    originalTokenCount: approxCodexOutputTokenCount(value),
+    totalLines: countOutputLines(value),
+  };
+}
+
+function normalizeNewlines(text) {
+  return String(text || '').replace(/\r\n/gu, '\n').replace(/\r/gu, '\n');
+}
+
+function lineAlignedPrefixByByteBudget(text, maxBytes) {
+  const prefix = utf8PrefixByByteBudget(text, maxBytes);
+  const newlineIndex = prefix.lastIndexOf('\n');
+  if (newlineIndex <= 0 || prefix.length === text.length) {
+    return prefix;
+  }
+
+  return prefix.slice(0, newlineIndex);
+}
+
+function lineAlignedSuffixByByteBudget(text, maxBytes) {
+  const suffix = utf8SuffixByByteBudget(text, maxBytes);
+  const newlineIndex = suffix.indexOf('\n');
+  if (newlineIndex < 0 || suffix.length === text.length) {
+    return suffix;
+  }
+
+  return suffix.slice(newlineIndex + 1);
+}
+
+function readContinuationHint(totalLines, pendingToolCall = null) {
+  const previousOffset = integerToolArgument(pendingToolCall?.arguments?.offset);
+  if (previousOffset === null) {
+    return READ_CONTINUATION_HINT;
+  }
+
+  const nextOffset = previousOffset + totalLines;
+  return `${READ_CONTINUATION_HINT} This Read started at offset ${previousOffset} and returned ${totalLines} line(s), so the next sequential offset is ${nextOffset}.`;
+}
+
+function limitCodexReadToolResultText(text, maxBytes, pendingToolCall = null) {
+  const value = normalizeNewlines(text);
+  const originalBytes = Buffer.byteLength(value, 'utf8');
+  const originalTokenCount = approxCodexOutputTokenCount(value);
+  const totalLines = countOutputLines(value);
+
+  if (!Number.isFinite(maxBytes) || originalBytes <= maxBytes) {
+    return {
+      text: value,
+      truncated: false,
+      originalBytes,
+      originalTokenCount,
+      totalLines,
+      readToolResult: true,
+    };
+  }
+
+  const warning =
+    `Warning: truncated Read output (original token count: ${originalTokenCount})\n` +
+    `Total output lines: ${totalLines}\n` +
+    'Read output was shortened for Codex context budget. If omitted content matters, reread a smaller chunk before advancing past it.\n' +
+    readContinuationHint(totalLines, pendingToolCall);
+  const warningBytes = byteLength(`${warning}\n\n`);
+  const markerBytes = byteLength(READ_OUTPUT_OMISSION_MARKER);
+  const contentBudget = Math.max(1, Math.trunc(maxBytes) - warningBytes - markerBytes);
+  const prefixBudget = Math.max(1, Math.floor(contentBudget / 2));
+  const suffixBudget = Math.max(1, contentBudget - prefixBudget);
+  let prefix = lineAlignedPrefixByByteBudget(value, prefixBudget);
+  let suffix = lineAlignedSuffixByByteBudget(value, suffixBudget);
+
+  if (!prefix) {
+    prefix = utf8PrefixByByteBudget(value, prefixBudget);
+  }
+  if (!suffix) {
+    suffix = utf8SuffixByByteBudget(value, suffixBudget);
+  }
+
+  return {
+    text: `${warning}\n\n${prefix}${READ_OUTPUT_OMISSION_MARKER}${suffix}`,
+    truncated: true,
+    originalBytes,
+    originalTokenCount,
+    totalLines,
+    readToolResult: true,
+  };
+}
+
+function limitCodexToolResultText(text, maxBytes, options = {}) {
+  if (isReadToolName(options.toolName)) {
+    return limitCodexReadToolResultText(text, maxBytes, options.pendingToolCall || null);
+  }
+
+  const result = truncateMiddleByByteBudget(text, maxBytes);
+  if (!result.truncated) {
+    return result;
+  }
+
+  return {
+    ...result,
+    text:
+      `Warning: truncated output (original token count: ${result.originalTokenCount})\n` +
+      `Total output lines: ${result.totalLines}\n\n` +
+      result.text,
+  };
+}
+
+function codexThreadConfigOverrides(config) {
+  const overrides = {};
+  const autoCompactTokenLimit = numberOrDefault(config?.codex?.autoCompactTokenLimit, 0);
+  const autoCompactTokenLimitScope =
+    config?.codex?.autoCompactTokenLimitScope || DEFAULT_AUTO_COMPACT_TOKEN_LIMIT_SCOPE;
+
+  if (autoCompactTokenLimit > 0) {
+    overrides.model_auto_compact_token_limit = Math.trunc(autoCompactTokenLimit);
+  }
+  if (typeof autoCompactTokenLimitScope === 'string' && autoCompactTokenLimitScope.trim() !== '') {
+    overrides.model_auto_compact_token_limit_scope = autoCompactTokenLimitScope.trim();
+  }
+
+  return overrides;
 }
 
 function codexInputMaxTokens(config) {
@@ -646,6 +1168,100 @@ function renderToolResultContent(content) {
   return joinTextParts(parts);
 }
 
+function readOffsetRewriteNote(readSanitization) {
+  if (!readSanitization?.offsetRemoved) {
+    return '';
+  }
+
+  const file = readSanitization.filePath ? ` for ${readSanitization.filePath}` : '';
+  const originalOffset = String(readSanitization.originalOffset ?? 'unknown');
+  if (readSanitization.offsetRemovedReason === READ_OFFSET_EXCEEDS_REASON) {
+    return (
+      `${READ_REWRITE_NOTE_HEADER}\n` +
+      `- Requested Read offset ${originalOffset}${file} exceeds the gateway rewrite threshold of ${READ_OFFSET_REWRITE_THRESHOLD}.\n` +
+      '- This Read starts at the beginning of the file.\n' +
+      '- For continuation reads, use offset after a prior Read of the same file returned content and more lines are needed.\n' +
+      '- Compute offset as prior offset plus the number of lines returned by that prior Read.'
+    );
+  }
+
+  return (
+    `${READ_REWRITE_NOTE_HEADER}\n` +
+    `- Requested Read offset ${originalOffset}${file} is not a valid non-negative integer offset.\n` +
+    '- The invalid offset was removed before running Read.\n' +
+    '- Use offset only as a zero-based continuation index after a prior Read returned content.'
+  );
+}
+
+function looksLikeReadOffsetResult(output) {
+  const lower = output.toLowerCase();
+  return (
+    lower.includes('offset') &&
+    (lower.includes('file has') ||
+      lower.includes('out of range') ||
+      (lower.includes('line') && lower.includes('requested')))
+  );
+}
+
+function looksLikeReadOffsetWarning(output) {
+  const lower = output.toLowerCase();
+  return lower.includes('warning') || lower.includes('system-reminder');
+}
+
+function shouldAppendReadOffsetGuidance(output, pendingToolCall, isError) {
+  if (!isReadToolName(pendingToolCall?.tool)) {
+    return false;
+  }
+
+  if (output.includes(READ_GUIDANCE_HEADER)) {
+    return false;
+  }
+
+  const args = pendingToolCall.arguments || {};
+  const hadOffset = pendingToolCall.readSanitization?.hadOffset || Object.hasOwn(args, 'offset');
+  if (!hadOffset) {
+    return false;
+  }
+
+  if (!looksLikeReadOffsetResult(output)) {
+    return false;
+  }
+
+  return isError || looksLikeReadOffsetWarning(output);
+}
+
+function appendReadToolResultFeedback(text, pendingToolCall, isError) {
+  let output = String(text || '');
+  const feedback = {
+    readTool: isReadToolName(pendingToolCall?.tool),
+    rewriteNoteAppended: false,
+    guidanceAppended: false,
+  };
+
+  if (!feedback.readTool) {
+    return {
+      text: output,
+      feedback,
+    };
+  }
+
+  const rewriteNote = readOffsetRewriteNote(pendingToolCall.readSanitization);
+  if (rewriteNote && !output.includes(READ_REWRITE_NOTE_HEADER)) {
+    output = `${output}\n\n${rewriteNote}`;
+    feedback.rewriteNoteAppended = true;
+  }
+
+  if (shouldAppendReadOffsetGuidance(output, pendingToolCall, isError)) {
+    output = `${output}\n\n${readOffsetGuidance()}`;
+    feedback.guidanceAppended = true;
+  }
+
+  return {
+    text: output,
+    feedback,
+  };
+}
+
 function renderTranscriptBlock(block) {
   if (block?.type === 'text') {
     return block.text || '';
@@ -698,6 +1314,149 @@ function renderLatestUserTranscriptInput(requestBody, maxTokens = Number.POSITIV
   return limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
 }
 
+function renderedTranscriptMessages(requestBody) {
+  const renderedMessages = [];
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const rendered = renderMessageTranscript(message);
+    if (!rendered) {
+      continue;
+    }
+
+    renderedMessages.push({
+      messageIndex: index,
+      role: message?.role || 'unknown',
+      text: rendered,
+    });
+  }
+
+  return renderedMessages;
+}
+
+function largestRenderedMessageSummaries(renderedMessages) {
+  const summaries = renderedMessages.map(function summarizeRenderedMessage(message) {
+    return {
+      message_index: message.messageIndex,
+      role: message.role,
+      bytes: byteLength(message.text),
+      estimated_tokens: estimateTokensFromText(message.text),
+    };
+  });
+
+  summaries.sort(function sortBySize(left, right) {
+    return right.bytes - left.bytes;
+  });
+  return summaries.slice(0, 5);
+}
+
+function summarizeTurnInput(requestBody, text, options = {}) {
+  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
+  const value = String(text || '');
+  return {
+    mode: options.mode || 'unknown',
+    max_tokens: Number.isFinite(options.maxTokens) ? options.maxTokens : null,
+    message_count: messages.length,
+    rendered_message_count: options.renderedMessageCount ?? null,
+    selected_message_count: options.selectedMessageCount ?? null,
+    omitted_message_count: options.omittedMessageCount ?? null,
+    text_bytes: byteLength(value),
+    text_chars: value.length,
+    estimated_tokens: estimateTokensFromText(value),
+    line_count: countOutputLines(value),
+    largest_rendered_messages: options.largestRenderedMessages || [],
+  };
+}
+
+function summarizeLatestTurnInput(
+  requestBody,
+  text,
+  maxTokens,
+  renderedMessages,
+  largestRenderedMessages = largestRenderedMessageSummaries(renderedMessages)
+) {
+  return summarizeTurnInput(requestBody, text, {
+    mode: 'latest',
+    maxTokens,
+    renderedMessageCount: renderedMessages.length,
+    selectedMessageCount: text ? 1 : 0,
+    omittedMessageCount: Math.max(0, renderedMessages.length - 1),
+    largestRenderedMessages,
+  });
+}
+
+function renderTranscriptInputWithSummary(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
+  const renderedItems = renderedTranscriptMessages(requestBody);
+  const renderedMessages = renderedItems.map(function renderedText(item) {
+    return item.text;
+  });
+  const largestRenderedMessages = largestRenderedMessageSummaries(renderedItems);
+
+  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
+    const text = joinTextParts(renderedMessages) || extractLatestUserText(requestBody);
+    return {
+      text,
+      summary: summarizeTurnInput(requestBody, text, {
+        mode: 'transcript',
+        maxTokens,
+        renderedMessageCount: renderedMessages.length,
+        selectedMessageCount: renderedMessages.length,
+        omittedMessageCount: 0,
+        largestRenderedMessages,
+      }),
+    };
+  }
+
+  const selected = [];
+  let usedTokens = 0;
+  let omittedCount = 0;
+  for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
+    const rendered = renderedMessages[index];
+    const tokens = estimateTokensFromText(rendered);
+    if (usedTokens + tokens <= maxTokens) {
+      selected.unshift(rendered);
+      usedTokens += tokens;
+      continue;
+    }
+
+    if (selected.length === 0) {
+      selected.unshift(limitTextByTokenBudget(rendered, maxTokens));
+      omittedCount = index;
+    } else {
+      omittedCount = index + 1;
+    }
+    break;
+  }
+
+  if (selected.length > 0) {
+    const text = fitTranscriptInputToBudget(selected, omittedCount, maxTokens);
+    return {
+      text,
+      summary: summarizeTurnInput(requestBody, text, {
+        mode: 'transcript',
+        maxTokens,
+        renderedMessageCount: renderedMessages.length,
+        selectedMessageCount: selected.length,
+        omittedMessageCount: omittedCount,
+        largestRenderedMessages,
+      }),
+    };
+  }
+
+  const text = renderLatestUserTranscriptInput(requestBody, maxTokens);
+  return {
+    text,
+    summary: summarizeLatestTurnInput(
+      requestBody,
+      text,
+      maxTokens,
+      renderedItems,
+      largestRenderedMessages
+    ),
+  };
+}
+
 function fitTranscriptInputToBudget(selectedMessages, omittedCount, maxTokens) {
   if (omittedCount <= 0) {
     return limitTextByTokenBudget(joinTextParts(selectedMessages), maxTokens);
@@ -730,52 +1489,15 @@ function fitTranscriptInputToBudget(selectedMessages, omittedCount, maxTokens) {
 }
 
 function renderTranscriptInput(requestBody, maxTokens = Number.POSITIVE_INFINITY) {
-  const renderedMessages = [];
-  const messages = Array.isArray(requestBody?.messages) ? requestBody.messages : [];
-
-  for (const message of messages) {
-    const rendered = renderMessageTranscript(message);
-    if (!rendered) {
-      continue;
-    }
-
-    renderedMessages.push(rendered);
-  }
-
-  if (!Number.isFinite(maxTokens) || maxTokens <= 0) {
-    return joinTextParts(renderedMessages) || extractLatestUserText(requestBody);
-  }
-
-  const selected = [];
-  let usedTokens = 0;
-  let omittedCount = 0;
-  for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
-    const rendered = renderedMessages[index];
-    const tokens = estimateTokensFromText(rendered);
-    if (usedTokens + tokens <= maxTokens) {
-      selected.unshift(rendered);
-      usedTokens += tokens;
-      continue;
-    }
-
-    if (selected.length === 0) {
-      selected.unshift(limitTextByTokenBudget(rendered, maxTokens));
-      omittedCount = index;
-    } else {
-      omittedCount = index + 1;
-    }
-    break;
-  }
-
-  if (selected.length > 0) {
-    return fitTranscriptInputToBudget(selected, omittedCount, maxTokens);
-  }
-
-  return renderLatestUserTranscriptInput(requestBody, maxTokens);
+  return renderTranscriptInputWithSummary(requestBody, maxTokens).text;
 }
 
 function isCodexContextWindowError(error) {
   return CODEX_CONTEXT_WINDOW_ERROR_PATTERN.test(error?.message || '');
+}
+
+function isCodexAutocompactThrashText(text) {
+  return CODEX_AUTOCOMPACT_THRASH_PATTERN.test(String(text || ''));
 }
 
 function isPossibleCodexContextWindowError(error) {
@@ -790,7 +1512,7 @@ function isPossibleCodexContextWindowError(error) {
   );
 }
 
-function extractToolResultPayload(requestBody, pendingToolCall) {
+function toolResultPayloadFromRequest(requestBody, callId) {
   const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
 
   for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex -= 1) {
@@ -804,7 +1526,7 @@ function extractToolResultPayload(requestBody, pendingToolCall) {
         continue;
       }
 
-      if (block.tool_use_id !== pendingToolCall.callId) {
+      if (block.tool_use_id !== callId) {
         continue;
       }
 
@@ -815,11 +1537,69 @@ function extractToolResultPayload(requestBody, pendingToolCall) {
     }
   }
 
+  return null;
+}
+
+function extractToolResultPayload(requestBody, pendingToolCall) {
+  const payload = toolResultPayloadFromRequest(requestBody, pendingToolCall.callId);
+  if (payload) {
+    return payload;
+  }
+
   throw new GatewayError(
     400,
     'invalid_request_error',
     `missing tool_result for pending tool call ${pendingToolCall.callId}`
   );
+}
+
+function toolResultPayloadDiagnostics(requestBody, callId) {
+  try {
+    return {
+      payload: toolResultPayloadFromRequest(requestBody, callId),
+      parseError: null,
+    };
+  } catch (error) {
+    return {
+      payload: null,
+      parseError: error?.message || String(error),
+    };
+  }
+}
+
+function readRequestDiagnostics(requestBody, pendingToolCall = null) {
+  const diagnostics = {
+    pending_read_tool: isReadToolName(pendingToolCall?.tool),
+    read_sanitization: readSanitizationTrace(pendingToolCall?.readSanitization),
+    matching_read_tool_result: false,
+    read_tool_result_bytes: 0,
+    read_tool_result_estimated_tokens: 0,
+    read_tool_result_lines: 0,
+    read_tool_result_is_error: false,
+    read_tool_result_parse_error: null,
+  };
+
+  if (!diagnostics.pending_read_tool || !pendingToolCall?.callId) {
+    return diagnostics;
+  }
+
+  const payloadDiagnostics = toolResultPayloadDiagnostics(requestBody, pendingToolCall.callId);
+  if (payloadDiagnostics.parseError) {
+    diagnostics.read_tool_result_parse_error = payloadDiagnostics.parseError;
+    return diagnostics;
+  }
+
+  const payload = payloadDiagnostics.payload;
+  if (!payload) {
+    return diagnostics;
+  }
+
+  diagnostics.matching_read_tool_result = true;
+  diagnostics.read_tool_result_bytes = byteLength(payload.text);
+  diagnostics.read_tool_result_estimated_tokens = approxCodexOutputTokenCount(payload.text);
+  diagnostics.read_tool_result_lines = countOutputLines(payload.text);
+  diagnostics.read_tool_result_is_error = payload.isError;
+  return diagnostics;
 }
 
 function mapReasoningEffort(reasoningEffort) {
@@ -1256,7 +2036,9 @@ class CodexGatewaySession {
     this.pendingToolCall = null;
     this.activeBoundary = null;
     this.routingReservation = null;
+    this.toolResultWindowBytes = 0;
     this.latestTotalUsage = emptyUsage();
+    this.latestContextTokens = 0;
     this.idleTimer = null;
     this.lastUsedAt = Date.now();
     this.disposed = false;
@@ -1338,6 +2120,18 @@ class CodexGatewaySession {
     return Math.min(budget, Math.max(1, Math.floor(recycleLimit * CODEX_BOOTSTRAP_RECYCLE_HEADROOM)));
   }
 
+  resetToolResultWindow(reason, tracer = null) {
+    if (this.toolResultWindowBytes <= 0) {
+      return;
+    }
+
+    traceLog(tracer || this.tracer, 'codex.tool_result_window.reset', {
+      reason,
+      previous_tool_result_window_bytes: this.toolResultWindowBytes,
+    });
+    this.toolResultWindowBytes = 0;
+  }
+
   initialInputMode() {
     if (this.bootstrapMode) {
       return this.bootstrapMode;
@@ -1351,12 +2145,36 @@ class CodexGatewaySession {
   }
 
   initialTurnInput(requestBody) {
+    return this.prepareInitialTurnInput(requestBody).text;
+  }
+
+  prepareInitialTurnInput(requestBody) {
     const maxTokens = this.bootstrapInputMaxTokens();
-    if (this.initialInputMode() === 'latest') {
-      return renderLatestUserTranscriptInput(requestBody, maxTokens);
+    const mode = this.initialInputMode();
+    if (mode === 'latest') {
+      const text = renderLatestUserTranscriptInput(requestBody, maxTokens);
+      const renderedMessages = renderedTranscriptMessages(requestBody);
+      return {
+        text,
+        summary: summarizeLatestTurnInput(requestBody, text, maxTokens, renderedMessages),
+      };
     }
 
-    return renderTranscriptInput(requestBody, maxTokens);
+    return renderTranscriptInputWithSummary(requestBody, maxTokens);
+  }
+
+  prepareTurnInput(requestBody, threadExists) {
+    if (!threadExists) {
+      return this.prepareInitialTurnInput(requestBody);
+    }
+
+    const maxTokens = this.inputMaxTokens();
+    const text = limitTextByTokenBudget(extractLatestUserText(requestBody), maxTokens);
+    const renderedMessages = renderedTranscriptMessages(requestBody);
+    return {
+      text,
+      summary: summarizeLatestTurnInput(requestBody, text, maxTokens, renderedMessages),
+    };
   }
 
   assertCompatible(route, requestBody, options = {}) {
@@ -1398,6 +2216,7 @@ class CodexGatewaySession {
       return;
     }
 
+    const threadConfig = codexThreadConfigOverrides(this.config);
     const result = await this.connection.request('thread/start', {
       model: this.route.upstreamModel,
       cwd: this.config.codex.cwd,
@@ -1407,6 +2226,7 @@ class CodexGatewaySession {
       dynamicTools: this.toolRegistry.dynamicTools,
       serviceName: 'ultrathink_gateway',
       threadSource: this.threadSource,
+      ...(Object.keys(threadConfig).length > 0 ? { config: threadConfig } : {}),
       ...(this.ephemeralThread ? { ephemeral: true } : {}),
     });
 
@@ -1419,21 +2239,37 @@ class CodexGatewaySession {
       thread_id: this.threadId,
       thread_source: this.threadSource,
       ephemeral_thread: this.ephemeralThread,
+      thread_config: threadConfig,
     });
   }
 
-  async startTurn(requestBody) {
+  async startTurn(requestBody, requestTracer = null) {
     const threadExists = Boolean(this.threadId);
     await this.ensureThread();
-    const latestUserText = threadExists
-      ? limitTextByTokenBudget(extractLatestUserText(requestBody), this.inputMaxTokens())
-      : this.initialTurnInput(requestBody);
+    const preparedInput = this.prepareTurnInput(requestBody, threadExists);
+    const tracer = this.scopedTracer(requestTracer);
+    const contextWindow = this.knownModelContextWindow();
+    const toolResultWindowMaxBytes = codexToolResultWindowMaxBytes(this.config);
+    traceLog(tracer, 'codex.turn.input_prepared', {
+      thread_id: this.threadId,
+      thread_exists: threadExists,
+      summary: preparedInput.summary,
+      context_tokens: this.latestContextTokens || 0,
+      model_context_window: contextWindow || null,
+      input_max_tokens: this.inputMaxTokens(),
+      bootstrap_input_max_tokens: this.bootstrapInputMaxTokens(),
+      recycle_context_limit: codexRecycleContextLimit(this.config, contextWindow),
+      tool_result_window_bytes: this.toolResultWindowBytes,
+      tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
+        ? toolResultWindowMaxBytes
+        : null,
+    });
     const result = await this.connection.request('turn/start', {
       threadId: this.threadId,
       input: [
         {
           type: 'text',
-          text: latestUserText,
+          text: preparedInput.text,
         },
       ],
       effort: mapReasoningEffort(this.route.reasoningEffort),
@@ -1453,15 +2289,62 @@ class CodexGatewaySession {
     }
 
     const rawToolResult = extractToolResultPayload(requestBody, this.pendingToolCall);
+    const readFeedback = appendReadToolResultFeedback(
+      rawToolResult.text,
+      this.pendingToolCall,
+      rawToolResult.isError
+    );
+    const toolResultMaxBytes = codexToolResultMaxBytes(this.config);
+    const toolResultWindowMaxBytes = codexToolResultWindowMaxBytes(this.config);
+    const toolResultWindowRemainingBytes = Number.isFinite(toolResultWindowMaxBytes)
+      ? Math.max(0, toolResultWindowMaxBytes - this.toolResultWindowBytes)
+      : Number.POSITIVE_INFINITY;
+    const effectiveToolResultMaxBytes = Math.min(
+      toolResultMaxBytes,
+      toolResultWindowRemainingBytes
+    );
+    const limitedToolResult = limitCodexToolResultText(
+      readFeedback.text,
+      effectiveToolResultMaxBytes,
+      {
+        toolName: this.pendingToolCall.tool,
+        pendingToolCall: this.pendingToolCall,
+      }
+    );
+    const finalToolResultText = limitTextByTokenBudget(
+      limitedToolResult.text,
+      this.inputMaxTokens()
+    );
     const toolResult = {
       ...rawToolResult,
-      text: limitTextByTokenBudget(rawToolResult.text, this.inputMaxTokens()),
+      text: finalToolResultText,
     };
+    const resultBytes = byteLength(toolResult.text);
+    this.toolResultWindowBytes += resultBytes;
     const tracer = this.scopedTracer(requestTracer);
     traceLog(tracer, 'codex.tool_result.continued', {
       call_id: this.pendingToolCall.callId,
       tool_name: this.pendingToolCall.tool,
+      raw_result_bytes: byteLength(rawToolResult.text),
+      prepared_result_bytes: byteLength(readFeedback.text),
+      result_bytes: resultBytes,
       result_length: toolResult.text.length,
+      tool_result_truncated: limitedToolResult.truncated,
+      tool_result_input_budget_truncated: finalToolResultText !== limitedToolResult.text,
+      tool_result_max_bytes: Number.isFinite(toolResultMaxBytes) ? toolResultMaxBytes : null,
+      tool_result_window_bytes: this.toolResultWindowBytes,
+      tool_result_window_max_bytes: Number.isFinite(toolResultWindowMaxBytes)
+        ? toolResultWindowMaxBytes
+        : null,
+      tool_result_window_remaining_bytes: Number.isFinite(toolResultWindowRemainingBytes)
+        ? toolResultWindowRemainingBytes
+        : null,
+      effective_tool_result_max_bytes: Number.isFinite(effectiveToolResultMaxBytes)
+        ? effectiveToolResultMaxBytes
+        : null,
+      read_tool_result: limitedToolResult.readToolResult === true,
+      read_result_feedback: readFeedback.feedback,
+      read_sanitization: readSanitizationTrace(this.pendingToolCall.readSanitization),
       is_error: toolResult.isError,
     });
     this.connection.send({
@@ -1552,7 +2435,7 @@ class CodexGatewaySession {
     this.activeBoundary = boundary;
 
     try {
-      const turnId = await this.startTurn(requestBody);
+      const turnId = await this.startTurn(requestBody, requestTracer);
       return this.beginBoundary(boundary, turnId, requestBody, requestTracer);
     } catch (error) {
       if (this.activeBoundary === boundary) {
@@ -1637,6 +2520,15 @@ class CodexGatewaySession {
         return;
       }
 
+      if (outcome.type === 'final' && isCodexAutocompactThrashText(outcome.text)) {
+        traceLog(tracer, 'codex.boundary.autocompact_thrash_detected', {
+          turn_id: turnId,
+          output_chars: outcome.text.length,
+        });
+        failBoundary(new GatewayError(502, 'api_error', outcome.text));
+        return;
+      }
+
       cleanup();
       boundary.finished = true;
       populateEstimatedUsage(boundary, requestBody, outcome);
@@ -1710,13 +2602,8 @@ class CodexGatewaySession {
         (message.params?.tokenUsage?.total || message.params?.tokenUsage?.last)
       ) {
         const tokenUsage = normalizeCodexTokenUsage(message.params.tokenUsage);
-        if (tokenUsage.total) {
-          boundary.usage = usageDelta(tokenUsage.total, boundary.usageBaseline);
-          this.latestTotalUsage = tokenUsage.total;
-        } else {
-          boundary.usage = tokenUsage.last || emptyUsage();
-          this.latestTotalUsage = addUsage(boundary.usageBaseline, boundary.usage);
-        }
+        boundary.usage = tokenUsage.last || usageDelta(tokenUsage.total, boundary.usageBaseline);
+        this.latestTotalUsage = tokenUsage.total || addUsage(boundary.usageBaseline, boundary.usage);
         if (tokenUsage.model_context_window) {
           this.modelContextWindow = tokenUsage.model_context_window;
           this.contextWindows?.set(this.route.upstreamModel, tokenUsage.model_context_window);
@@ -1724,17 +2611,28 @@ class CodexGatewaySession {
         // Prefer the per-turn snapshot (tracks shrinkage after app-server
         // compaction); fall back to the cumulative total, which overestimates
         // live context — the safe direction for recycle pressure.
-        this.latestContextTokens =
+        const previousContextTokens = this.latestContextTokens || 0;
+        const latestContextTokens =
           contextTokensFromUsage(tokenUsage.last) ||
           contextTokensFromUsage(tokenUsage.total) ||
-          this.latestContextTokens ||
+          previousContextTokens ||
           0;
+        this.latestContextTokens = latestContextTokens;
+        if (
+          previousContextTokens > 0 &&
+          latestContextTokens > 0 &&
+          latestContextTokens < Math.floor(previousContextTokens * CODEX_CONTEXT_DROP_RESET_FRACTION)
+        ) {
+          this.resetToolResultWindow('context_usage_drop', tracer);
+        }
         traceLog(tracer, 'codex.usage.updated', {
           turn_id: turnId,
           usage: boundary.usage,
           total_usage: tokenUsage.total,
           last_usage: tokenUsage.last,
           model_context_window: tokenUsage.model_context_window,
+          previous_context_tokens: previousContextTokens,
+          latest_context_tokens: latestContextTokens,
         });
         boundary.emit({
           type: 'usage',
@@ -1775,6 +2673,11 @@ class CodexGatewaySession {
 
       const params = message.params;
       const originalName = originalToolName(this.toolRegistry, params.tool);
+      const sanitizedToolCall = sanitizeCodexToolCallArguments(
+        originalName,
+        params.arguments || {},
+        params.callId || null
+      );
       if (this.pendingToolCall) {
         const errorMessage =
           `parallel Codex tool call ${params.callId || 'unknown'} rejected while waiting ` +
@@ -1798,17 +2701,28 @@ class CodexGatewaySession {
         return;
       }
 
+      if (sanitizedToolCall.readSanitization?.changed) {
+        traceLog(tracer, 'codex.read_tool.arguments_sanitized', {
+          turn_id: turnId,
+          call_id: params.callId,
+          tool_name: originalName,
+          sanitization: readSanitizationTrace(sanitizedToolCall.readSanitization),
+        });
+      }
+
       this.pendingToolCall = {
         requestId: message.id,
         turnId,
         callId: params.callId,
         tool: originalName,
-        arguments: params.arguments || {},
+        arguments: sanitizedToolCall.arguments,
+        readSanitization: sanitizedToolCall.readSanitization,
       };
       traceLog(tracer, 'codex.tool_call.pending', {
         turn_id: turnId,
         call_id: params.callId,
         tool_name: originalName,
+        read_sanitization: readSanitizationTrace(sanitizedToolCall.readSanitization),
       });
 
       deferredToolUseOutcome = {
@@ -1817,7 +2731,7 @@ class CodexGatewaySession {
         toolCall: {
           id: params.callId,
           name: originalName,
-          input: params.arguments || {},
+          input: sanitizedToolCall.arguments,
         },
       };
       scheduleDeferredToolUseFallback();
@@ -2090,8 +3004,12 @@ export class CodexSessionManager {
         selection_reason: selection.selectionReason,
         context_tokens: pressure.contextTokens,
         incoming_tokens: pressure.incomingTokens,
+        projected_live_tokens: pressure.projectedLiveTokens,
+        replay_transcript_tokens: pressure.replayTranscriptTokens || null,
+        projected_tokens: pressure.projectedTokens,
         recycle_limit: pressure.limit,
         model_context_window: session.knownModelContextWindow?.() || null,
+        read_context: readRequestDiagnostics(requestBody, session.pendingToolCall),
       });
       this.sessions.delete(selection.sessionKey);
       void session.close(new Error('recycled before Codex context window overflow'));
@@ -2204,6 +3122,10 @@ export class CodexSessionManager {
       traceLog(options.requestTracer || this.tracer, 'codex.session.context_recovery_retry', {
         bootstrap_mode: bootstrapMode,
         error_message: lastError?.message || String(lastError),
+        read_context: readRequestDiagnostics(
+          options.requestBody,
+          options.attemptState.lastPreparedSession?.pendingToolCall
+        ),
       });
 
       try {
@@ -2256,6 +3178,10 @@ export class CodexSessionManager {
       traceLog(tracer, 'codex.session.context_recovery_skipped', {
         error_message: error?.message || String(error),
         aborted: options.req?.abortSignal?.aborted === true,
+        read_context: readRequestDiagnostics(
+          options.requestBody,
+          options.attemptState?.lastPreparedSession?.pendingToolCall
+        ),
       });
       return;
     }
@@ -2265,6 +3191,10 @@ export class CodexSessionManager {
         error_message: error?.message || String(error),
         gateway_error_status: error.status,
         gateway_error_type: error.type,
+        read_context: readRequestDiagnostics(
+          options.requestBody,
+          options.attemptState?.lastPreparedSession?.pendingToolCall
+        ),
       });
     }
   }
@@ -2290,19 +3220,37 @@ export class CodexSessionManager {
     }
 
     const contextTokens = Number(session.latestContextTokens || 0);
-    if (contextTokens <= 0) {
-      return null;
-    }
 
     // Project the incoming payload on top of the live context so a single
     // oversized tool result cannot leap past the window in one turn.
     const limit = this.recycleContextTokenLimit(session);
     const incomingTokens = estimateIncomingRequestTokens(requestBody);
-    if (contextTokens + incomingTokens < limit) {
+    const projectedLiveTokens = contextTokens > 0 ? contextTokens + incomingTokens : 0;
+    // Matching tool_result follow-ups can arrive with stale or partial
+    // app-server usage snapshots. Compare against the full Claude replay too:
+    // if replaying the same request would already exceed the recycle
+    // threshold, prefer a fresh transcript-bounded session over continuing
+    // the old paused tool call.
+    const replayTranscriptTokens =
+      selectionReason === 'matching_tool_result'
+        ? estimateReplayTranscriptTokens(requestBody)
+        : 0;
+    if (projectedLiveTokens <= 0 && replayTranscriptTokens <= 0) {
+      return null;
+    }
+    const projectedTokens = Math.max(projectedLiveTokens, replayTranscriptTokens);
+    if (projectedTokens < limit) {
       return null;
     }
 
-    return { contextTokens, incomingTokens, limit };
+    return {
+      contextTokens,
+      incomingTokens,
+      projectedLiveTokens,
+      replayTranscriptTokens,
+      projectedTokens,
+      limit,
+    };
   }
 
   canRecoverFromContextOverflow(error, options) {

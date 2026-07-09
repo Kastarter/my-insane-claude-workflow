@@ -14,8 +14,10 @@ const DEFAULT_ANTHROPIC_PASSTHROUGH_MODELS = Object.freeze(['claude-opus-4-8*'])
 
 const DEFAULT_CODEX_SANDBOX = 'workspace-write';
 const DEFAULT_CODEX_APPROVAL_POLICY = 'never';
+const DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE = 'body_after_prefix';
 const DISABLED_FLAG_VALUES = new Set(['0', 'false', 'no', 'off']);
 const LOOPBACK_HOSTS = new Set(['localhost', '::1', '[::1]']);
+const CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES = new Set(['total', 'body_after_prefix']);
 
 const CODEX_PROFILE_ENV = Object.freeze({
   model: ['ULTRATHINK_GATEWAY_CODEX_MODEL', 'ULTRATHINK_GATEWAY_OPENAI_MODEL'],
@@ -30,6 +32,14 @@ const DEEPSEEK_PROFILE_ENV = Object.freeze({
   reasoningEffort: [
     'ULTRATHINK_GATEWAY_DEEPSEEK_REASONING_EFFORT',
     'ULTRATHINK_DEEPSEEK_REASONING_EFFORT',
+  ],
+});
+const GLM_PROFILE_ENV = Object.freeze({
+  model: ['ULTRATHINK_GATEWAY_GLM_MODEL', 'GLM_DEFAULT_MODEL_ID', 'ZAI_DEFAULT_MODEL_ID'],
+  reasoningEffort: [
+    'ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT',
+    'ULTRATHINK_GLM_REASONING_EFFORT',
+    'ZAI_REASONING_EFFORT',
   ],
 });
 
@@ -105,6 +115,20 @@ function optionalResolvedPath(value) {
   return path.resolve(expandHomePath(configured));
 }
 
+function codexAutoCompactTokenLimitScope(value) {
+  const normalized = firstDefinedString(
+    value,
+    DEFAULT_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE
+  ).toLowerCase();
+  if (!CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPES.has(normalized)) {
+    throw new Error(
+      'ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE must be total or body_after_prefix'
+    );
+  }
+
+  return normalized;
+}
+
 function codexProfileValue(key, fallback) {
   return firstEnvString(CODEX_PROFILE_ENV[key], fallback);
 }
@@ -113,10 +137,21 @@ function deepSeekProfileValue(key, fallback) {
   return firstEnvString(DEEPSEEK_PROFILE_ENV[key], fallback);
 }
 
-function deepSeekThinking() {
+function glmProfileValue(key, fallback) {
+  return firstEnvString(GLM_PROFILE_ENV[key], fallback);
+}
+
+function thinkingForProvider(provider) {
   const thinkingLevel = firstEnvString(['ULTRATHINK_THINKING_LEVEL']).toUpperCase();
   if (thinkingLevel === 'OFF') {
     return { type: 'disabled' };
+  }
+
+  if (provider === 'glm') {
+    return {
+      type: 'enabled',
+      clear_thinking: false,
+    };
   }
 
   return { type: 'enabled' };
@@ -186,6 +221,24 @@ export function loadGatewayConfig() {
         256_000,
         { min: 0, max: 1_000_000 }
       ),
+      toolResultMaxBytes: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES,
+        10_000,
+        { min: 0, max: 10_000_000 }
+      ),
+      toolResultWindowMaxBytes: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES,
+        64_000,
+        { min: 0, max: 100_000_000 }
+      ),
+      autoCompactTokenLimit: clampNumber(
+        process.env.ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+        0,
+        { min: 0, max: 1_000_000 }
+      ),
+      autoCompactTokenLimitScope: codexAutoCompactTokenLimitScope(
+        process.env.ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE
+      ),
       idleTimeoutMs: clampNumber(
         process.env.ULTRATHINK_GATEWAY_CODEX_IDLE_TIMEOUT_MS,
         10 * 60_000,
@@ -236,7 +289,24 @@ export function loadGatewayConfig() {
       ),
       model: deepSeekProfileValue('model', 'deepseek-v4-pro'),
       reasoningEffort: deepSeekProfileValue('reasoningEffort', 'max'),
-      thinking: deepSeekThinking(),
+      thinking: thinkingForProvider('deepseek'),
+    },
+    glm: {
+      apiKey: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_GLM_API_KEY,
+        process.env.ZAI_API_KEY,
+        process.env.GLM_API_KEY,
+        ''
+      ),
+      baseUrl: firstDefinedString(
+        process.env.ULTRATHINK_GATEWAY_GLM_BASE_URL,
+        process.env.ZAI_BASE_URL,
+        process.env.GLM_BASE_URL,
+        'https://api.z.ai/api/coding/paas/v4'
+      ),
+      model: glmProfileValue('model', 'glm-5.2'),
+      reasoningEffort: glmProfileValue('reasoningEffort', 'max'),
+      thinking: thinkingForProvider('glm'),
     },
     anthropic: {
       apiKey: firstDefinedString(

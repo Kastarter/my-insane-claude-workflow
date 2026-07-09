@@ -81,7 +81,7 @@ bash scripts/claude-workflow-daemon.sh install-shell
 
 The daemon uses `ULTRATHINK_GATEWAY_DAEMON_PORT` (default `4318`), deliberately separate from the launcher's `ULTRATHINK_GATEWAY_PORT`. The `claude-workflow` launcher still overrides the daemon exports with its own private gateway.
 
-To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000` before a live window is learned; the standalone raw gateway default is `256000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of the window. If Codex still reports context exhaustion before stream output is forwarded, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
+To keep long-running workflows from overflowing Codex's context window, the gateway learns the upstream model window from Codex app-server usage reports and adapts each input budget to `min(configured ceiling, window * 0.8)`. The workflow launcher and daemon default `ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS` to `180000`; the standalone raw gateway default is `192000`. Live sessions recycle onto a fresh bounded transcript-replay thread once reported context plus the incoming payload passes 75% of that effective budget, not 75% of a larger model window. New Codex threads also set `model_auto_compact_token_limit_scope=body_after_prefix` by default so post-compaction summaries do not immediately count against the next compaction window again; the workflow launcher and daemon default `model_auto_compact_token_limit` to 70% of the Codex input ceiling unless `ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT` is set. Claude tool results sent back to Codex dynamic tools are capped per result by `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES` (default `10000`, set `0` to disable) and across a session by `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES` (default `64000`, set `0` to disable). The aggregate budget resets after Codex reports a real context shrink. If Codex still reports context exhaustion before stream output is forwarded, including `prompt is too long: ... maximum`, the gateway retries on a clean thread with bounded transcript replay first, then current-request-only input.
 
 Permission flags:
 
@@ -130,6 +130,10 @@ ULTRATHINK_GATEWAY_CODEX_VERBOSITY=low
 ULTRATHINK_GATEWAY_CODEX_SANDBOX=workspace-write
 ULTRATHINK_GATEWAY_CODEX_APPROVAL_POLICY=never
 ULTRATHINK_GATEWAY_CODEX_INPUT_MAX_TOKENS=180000
+ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES=10000
+ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_WINDOW_MAX_BYTES=64000
+ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT=126000
+ULTRATHINK_GATEWAY_CODEX_AUTO_COMPACT_TOKEN_LIMIT_SCOPE=body_after_prefix
 ULTRATHINK_GATEWAY_CODEX_FORK_IDLE_TIMEOUT_MS=30000
 ULTRATHINK_GATEWAY_CODEX_MAX_SESSIONS=16
 ```
@@ -153,11 +157,35 @@ DeepSeek V4 uses a 1M context window by default, so `[1m]` Claude aliases can ma
 DeepSeek thinking is enabled by default and sends `reasoning_effort=max`.
 Set `ULTRATHINK_THINKING_LEVEL=OFF` to disable DeepSeek thinking; gateway requests then send `thinking.type=disabled` and omit `reasoning_effort`.
 
+GLM main route:
+
+```bash
+ULTRATHINK_GATEWAY_MAIN_PROVIDER=glm
+ULTRATHINK_GATEWAY_MAIN_MODEL_ID=glm-5.2[1m]
+ULTRATHINK_GATEWAY_GLM_API_KEY=your_zai_api_key
+ULTRATHINK_GATEWAY_GLM_MODEL=glm-5.2
+ULTRATHINK_GATEWAY_GLM_REASONING_EFFORT=max
+# Optional explicit default endpoint:
+# ULTRATHINK_GATEWAY_GLM_BASE_URL=https://api.z.ai/api/coding/paas/v4
+# Optional opt-out: ULTRATHINK_THINKING_LEVEL=OFF
+```
+
+GLM routes use Z.ai's OpenAI-compatible Coding Plan endpoint. `ZAI_API_KEY` and `GLM_API_KEY` are also accepted for local configuration.
+GLM 5.2 uses `glm-5.2` upstream. Client-visible aliases such as `glm-5.2[1m]` are exposed to Claude Code but stripped before the Z.ai API call.
+GLM thinking is enabled by default with `thinking.type=enabled`, `clear_thinking=false`, and `reasoning_effort=max`. GLM routes preserve `reasoning_content` across tool-result turns.
+
 Standalone route-map entries can also use exact keys or wildcard keys. Exact keys win before wildcard keys:
 
 ```bash
 ULTRATHINK_GATEWAY_EXPOSED_MODELS=claude-fable-5[1m]
 ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"claude-fable-5*":{"provider":"deepseek","model":"deepseek-v4-pro","reasoningEffort":"max","displayName":"Fable 5 via DeepSeek V4 Pro"}}'
+```
+
+GLM route-map entries use the same shape:
+
+```bash
+ULTRATHINK_GATEWAY_EXPOSED_MODELS=glm-5.2[1m]
+ULTRATHINK_GATEWAY_ROUTE_MAP_JSON='{"glm-5.2[1m]":{"provider":"glm","model":"glm-5.2","reasoningEffort":"max","displayName":"GLM 5.2"}}'
 ```
 
 Wildcard route-map keys match requests, but they are not concrete model ids. Set `ULTRATHINK_GATEWAY_EXPOSED_MODELS` when a standalone client depends on `/v1/models` discovery.
@@ -191,6 +219,7 @@ Endpoints:
 npm install
 npm run check
 npm test
+npm run test:live:glm
 ```
 
-The gateway test suite uses fake Claude/Codex app-server processes for offline coverage of routing, streaming, tool calls, session reuse, startup reservations, proxy behavior, and launcher preflight handling.
+The gateway test suite uses fake Claude/Codex app-server processes for offline coverage of routing, streaming, tool calls, session reuse, startup reservations, proxy behavior, and launcher preflight handling. `npm run test:live:glm` spends live Z.ai quota only when `ULTRATHINK_GATEWAY_GLM_API_KEY`, `ZAI_API_KEY`, or `GLM_API_KEY` is set.
