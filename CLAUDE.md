@@ -25,7 +25,7 @@ Personal build of `claude-workflow`, derived from the MIT-licensed `ultrathink` 
 ## Current State
 - Synced to upstream 2026-07 (added daemon, proxy, workflow-config, undici, resume/continue passthrough).
 - Second upstream sync 2026-07 (3-way merge of `3672d87..dc74f05`): GLM 5.2 gateway routing (`glm` provider, `ULTRATHINK_GATEWAY_GLM_*` / `ZAI_*` env), Codex context-pressure fixes (tool-result byte caps `ULTRATHINK_GATEWAY_CODEX_TOOL_RESULT_MAX_BYTES`, auto-compact token limit + scope), Codex Read tool hardening, `test/glm/live-glm-gateway.js`. My refusal-fallback feature merged clean alongside it. Suite: 127 pass.
-- Sync method for future upstream commits: fresh clone upstream, per-file `git merge-file` (base = last-synced upstream SHA, ours = repo, theirs = new upstream), then re-verify identity (package.json/README/LICENSE) and scrub `yshaaban`.
+- Sync method for future upstream commits: fresh clone upstream, per-file `git merge-file` (base = last-synced upstream SHA, ours = repo, theirs = new upstream), then re-verify identity (package.json/README/LICENSE) and scrub the upstream author's GitHub handle and npm scope.
 - Local `claude-workflow` command runs from this repo via `~/.local/bin/claude-workflow` wrapper (pins nvm node 22).
 
 ## Commit convention
